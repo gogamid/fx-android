@@ -14,16 +14,9 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: ${{ matrix.name }}
+  bionic-pie:
+    name: bionic-pie (NDK, direct exec)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: musl-pie
-            target: aarch64-linux-musl
-            desc: Static musl PIE (direct exec on Android, no loader needed)
     steps:
       - uses: actions/checkout@v4
 
@@ -32,22 +25,75 @@ jobs:
         with:
           version: "0.16.0"
 
-      - name: Build (${{ matrix.name }})
+      - name: Install Android NDK sysroot
         run: |
-          zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dpie=true
+          wget -q https://dl.google.com/android/repository/android-ndk-r28-linux.zip
+          unzip -q android-ndk-r28-linux.zip
+          ln -s "$PWD"/android-ndk-r28 "$HOME/ndk"
+          ls "$HOME/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/"
+
+      - name: Write zig libc file
+        run: |
+          SYS="$HOME/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          API=""
+          for v in 36 35 34 33 32 31 30; do
+            if [ -d "$SYS/usr/lib/aarch64-linux-android/$v" ]; then API=$v; break; fi
+          done
+          echo "using API $API"
+          echo "API=$API" >> "$GITHUB_ENV"
+          cat > libc.txt <<EOF
+          include_dir=$SYS/usr/include
+          sys_include_dir=$SYS/usr/include
+          crt_dir=$SYS/usr/lib/aarch64-linux-android/$API
+          EOF
+          cat libc.txt
+
+      - name: Build fx (bionic PIE)
+        run: |
+          zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-android.$API -Dpie=true --libc libc.txt
           file zig-out/bin/fx
-          readelf -h zig-out/bin/fx | grep -E 'Type|Machine' || true
+          readelf -h zig-out/bin/fx | grep -E 'Type|Machine'
+          readelf -l zig-out/bin/fx | grep -E 'interpreter|INTERP' || true
 
       - name: Package
         run: |
           mkdir -p pkg
           cp zig-out/bin/fx LICENSE THIRD_PARTY_NOTICES.md pkg/
-          tar -czf fx-${{ matrix.name }}.tar.gz -C pkg fx LICENSE THIRD_PARTY_NOTICES.md
-          sha256sum fx-${{ matrix.name }}.tar.gz
+          tar -czf fx-bionic-pie.tar.gz -C pkg fx LICENSE THIRD_PARTY_NOTICES.md
+          sha256sum fx-bionic-pie.tar.gz
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: fx-${{ matrix.name }}
-          path: fx-${{ matrix.name }}.tar.gz
+          name: fx-bionic-pie
+          path: fx-bionic-pie.tar.gz
+          retention-days: 30
+
+  musl-static:
+    name: musl-static (ldnp fallback)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Build fx (static musl, non-PIE)
+        run: |
+          zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl
+          file zig-out/bin/fx
+          readelf -h zig-out/bin/fx | grep -E 'Type|Machine'
+
+      - name: Package
+        run: |
+          mkdir -p pkg
+          cp zig-out/bin/fx LICENSE THIRD_PARTY_NOTICES.md pkg/
+          tar -czf fx-musl-static.tar.gz -C pkg fx LICENSE THIRD_PARTY_NOTICES.md
+          sha256sum fx-musl-static.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fx-musl-static
+          path: fx-musl-static.tar.gz
           retention-days: 30
