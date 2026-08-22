@@ -41,6 +41,15 @@ jobs:
           done
           echo "using API $API"
           echo "API=$API" >> "$GITHUB_ENV"
+          # NDK r27+ keeps bionic stubs (libc.so/libm.so/libdl.so) at the top-level
+          # lib dir; zig looks for them in crt_dir, so symlink them in.
+          CRT="$SYS/usr/lib/aarch64-linux-android/$API"
+          for lib in libc.so libdl.so libm.so liblog.so; do
+            if [ -f "$SYS/usr/lib/aarch64-linux-android/$lib" ]; then
+              ln -sf "../$lib" "$CRT/$lib"
+            fi
+          done
+          ls "$CRT" | head -20
           cat > libc.txt <<EOF
           include_dir=$SYS/usr/include
           sys_include_dir=$SYS/usr/include
