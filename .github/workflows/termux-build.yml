@@ -45,6 +45,8 @@ jobs:
           include_dir=$SYS/usr/include
           sys_include_dir=$SYS/usr/include
           crt_dir=$SYS/usr/lib/aarch64-linux-android/$API
+          msvc_lib_dir=
+          kernel32_lib_dir=
           EOF
           cat libc.txt
 
