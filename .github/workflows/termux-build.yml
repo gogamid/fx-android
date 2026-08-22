@@ -47,6 +47,7 @@ jobs:
           crt_dir=$SYS/usr/lib/aarch64-linux-android/$API
           msvc_lib_dir=
           kernel32_lib_dir=
+          gcc_dir=
           EOF
           cat libc.txt
 
