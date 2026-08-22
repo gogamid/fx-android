@@ -21,12 +21,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: android-pie
-            target: aarch64-linux-android
-            arch: aarch64
-          - name: musl-static
+          - name: musl-pie
             target: aarch64-linux-musl
-            arch: aarch64
+            desc: Static musl PIE (direct exec on Android, no loader needed)
     steps:
       - uses: actions/checkout@v4
 
@@ -37,7 +34,7 @@ jobs:
 
       - name: Build (${{ matrix.name }})
         run: |
-          zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+          zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dpie=true
           file zig-out/bin/fx
           readelf -h zig-out/bin/fx | grep -E 'Type|Machine' || true
 

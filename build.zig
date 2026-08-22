@@ -66,6 +66,12 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addImport("build_options", build_options.createModule());
 
+    // Termux: force PIE for direct exec on Android (Android 16 rejects non-PIE).
+    // Pass -Dpie=true to build a static PIE; default keeps upstream behavior.
+    if (b.option(bool, "pie", "Force position-independent executable (needed for direct exec on Android/Termux)")) |pie| {
+        exe.pie = pie;
+    }
+
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
