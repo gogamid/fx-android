@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const types = @import("../shared/types.zig");
@@ -67,7 +68,7 @@ test "permission request exposes amendment capability" {
 
 test "owned permission request carries an independent explanation" {
     const request: PermissionRequest = .{
-        .label = "terminal.exec touch marker.txt",
+        .label = "shell.run touch marker.txt",
         .explanation = "Auto agent couldn’t approve because the action needs review",
     };
     var owned = try OwnedPermissionRequest.dupe(std.testing.allocator, request);
@@ -100,7 +101,7 @@ test "owned permission request carries an independent tool arguments preview" {
 
 test "owned permission request carries an independent subagent origin" {
     const request: PermissionRequest = .{
-        .label = "terminal.exec touch marker.txt",
+        .label = "shell.run touch marker.txt",
         .origin = .{ .subagent = "approval-child" },
     };
     var owned = try OwnedPermissionRequest.dupe(std.testing.allocator, request);
@@ -127,7 +128,7 @@ test "permission request bounds the optional explanation" {
     try std.testing.expectError(
         error.ExplanationTooLong,
         OwnedPermissionRequest.dupe(std.testing.allocator, .{
-            .label = "terminal.exec touch marker.txt",
+            .label = "shell.run touch marker.txt",
             .explanation = explanation,
         }),
     );
@@ -158,7 +159,7 @@ test "permission request bounds the subagent origin" {
     try std.testing.expectError(
         error.SubagentOriginTooLong,
         OwnedPermissionRequest.dupe(std.testing.allocator, .{
-            .label = "terminal.exec touch marker.txt",
+            .label = "shell.run touch marker.txt",
             .origin = .{ .subagent = child_name },
         }),
     );
@@ -810,7 +811,7 @@ test "file request rejects one byte over every owned component boundary" {
 
 test "owned permission request cleans up partial allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkOwnedRequestAllocFailures,
         .{},
     );

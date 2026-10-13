@@ -13,6 +13,7 @@ const State = struct {
 };
 
 const default_log_max_bytes: u64 = 2 * 1024 * 1024;
+const max_trace_line_bytes: usize = 64 * 1024;
 
 pub const Options = struct {
     file_path: ?[]const u8 = null,
@@ -30,6 +31,7 @@ var state_mutex: std.Io.Mutex = .init;
 var state: State = .{};
 var next_turn_id = std.atomic.Value(u64).init(1);
 var next_step_id = std.atomic.Value(u64).init(1);
+var next_subagent_id = std.atomic.Value(u64).init(1);
 
 pub fn configureFromEnv(alloc: Allocator, workspace_root: []const u8) void {
     const options = loadOptionsFromEnv(alloc, workspace_root) catch return;
@@ -58,13 +60,18 @@ pub fn activeLogPath() ?[]const u8 {
 }
 
 pub fn nextTurnId() u64 {
-    if (comptime @import("builtin").os.tag == .wasi) return 1;
+    if (comptime @import("builtin").target.os.tag == .wasi) return 1;
     return next_turn_id.fetchAdd(1, .seq_cst);
 }
 
 pub fn nextStepId() u64 {
-    if (comptime @import("builtin").os.tag == .wasi) return 1;
+    if (comptime @import("builtin").target.os.tag == .wasi) return 1;
     return next_step_id.fetchAdd(1, .seq_cst);
+}
+
+pub fn nextSubagentId() u64 {
+    if (comptime @import("builtin").target.os.tag == .wasi) return 1;
+    return next_subagent_id.fetchAdd(1, .seq_cst);
 }
 
 pub fn logf(scope: []const u8, comptime fmt: []const u8, args: anytype) void {
@@ -123,10 +130,31 @@ const TraceLine = struct {
     noinline fn end(line: *TraceLine) void {
         defer line.out.deinit();
         if (line.failed) return;
-        line.out.writer.writeByte('\n') catch return;
-        writeLine(line.out.written());
+        var safe: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+        defer safe.deinit();
+        writeTerminalSafeTraceLine(&safe.writer, line.out.written()) catch return;
+        safe.writer.writeByte('\n') catch return;
+        writeLine(safe.written());
     }
 };
+
+fn writeTerminalSafeTraceLine(writer: *std.Io.Writer, raw: []const u8) !void {
+    const marker = "...";
+    var index: usize = 0;
+    while (index < raw.len) : (index += 1) {
+        const byte = raw[index];
+        const encoded_len: usize = if (byte >= 0x20 and byte <= 0x7e) 1 else 4;
+        if (writer.buffered().len + encoded_len + marker.len > max_trace_line_bytes) {
+            try writer.writeAll(marker);
+            return;
+        }
+        if (encoded_len == 1) {
+            try writer.writeByte(byte);
+        } else {
+            try writer.print("\\x{x:0>2}", .{byte});
+        }
+    }
+}
 
 pub fn preview(text: []const u8, max_len: usize) []const u8 {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
@@ -190,7 +218,7 @@ pub fn redactedJsonPreview(alloc: Allocator, text: []const u8) ![]u8 {
     if (text.len == 0) return alloc.dupe(u8, "<empty>");
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch {
-        return std.fmt.allocPrint(alloc, "<invalid-json bytes={d}>", .{text.len});
+        return alloc.print("<invalid-json bytes={d}>", .{text.len});
     };
     defer parsed.deinit();
 
@@ -205,7 +233,7 @@ pub fn keylessJsonPreview(alloc: Allocator, text: []const u8) ![]u8 {
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch |err| {
         if (err == error.OutOfMemory) return err;
-        return std.fmt.allocPrint(alloc, "<invalid-json bytes={d}>", .{text.len});
+        return alloc.print("<invalid-json bytes={d}>", .{text.len});
     };
     defer parsed.deinit();
 
@@ -288,6 +316,7 @@ pub fn resetForTest() void {
     shutdown();
     next_turn_id.store(1, .seq_cst);
     next_step_id.store(1, .seq_cst);
+    next_subagent_id.store(1, .seq_cst);
 }
 
 pub fn configureForTest(alloc: Allocator, path: []const u8) !void {
@@ -435,12 +464,12 @@ fn scopeFilterAllows(filter: []const u8, scope: []const u8) bool {
 fn resolveLogPath(alloc: Allocator, workspace_root: []const u8, raw_path: []const u8) ![]u8 {
     const trimmed = std.mem.trim(u8, raw_path, " \t\r\n");
     if (trimmed.len == 0) return error.InvalidTracePath;
-    if (std.fs.path.isAbsolute(trimmed)) return alloc.dupe(u8, trimmed);
-    return std.fs.path.join(alloc, &.{ workspace_root, trimmed });
+    if (std.Io.Dir.path.isAbsolute(trimmed)) return alloc.dupe(u8, trimmed);
+    return std.Io.Dir.path.join(alloc, &.{ workspace_root, trimmed });
 }
 
 fn defaultLogPath(alloc: Allocator) ![]u8 {
-    if (io_mod.getenv("HOME")) |home| {
+    if (io_mod.homeDir()) |home| {
         return defaultLogPathForHome(alloc, home);
     }
     return fallbackLogPathForMillis(alloc, io_mod.milliTimestamp());
@@ -451,11 +480,11 @@ fn defaultLogPathForHome(alloc: Allocator, home: []const u8) ![]u8 {
 }
 
 fn fallbackLogPathForMillis(alloc: Allocator, millis: i64) ![]u8 {
-    return std.fmt.allocPrint(alloc, "/tmp/fx-trace-{d}.log", .{millis});
+    return alloc.print("/tmp/fx-trace-{d}.log", .{millis});
 }
 
 fn ensureParentDir(path: []const u8) !void {
-    const parent = std.fs.path.dirname(path) orelse return;
+    const parent = std.Io.Dir.path.dirname(path) orelse return;
     try makeAbsolutePath(parent);
 }
 
@@ -464,7 +493,7 @@ fn makeAbsolutePath(path: []const u8) !void {
     std.Io.Dir.createDirAbsolute(zio, path, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
-            if (std.fs.path.dirname(path)) |parent| {
+            if (std.Io.Dir.path.dirname(path)) |parent| {
                 try makeAbsolutePath(parent);
                 try std.Io.Dir.createDirAbsolute(zio, path, .default_dir);
             } else {
@@ -479,7 +508,7 @@ fn tmpRoot(alloc: Allocator, tmp: std.testing.TmpDir) ![]u8 {
 }
 
 fn tmpPath(alloc: Allocator, root: []const u8, name: []const u8) ![]u8 {
-    return std.fs.path.join(alloc, &.{ root, name });
+    return std.Io.Dir.path.join(alloc, &.{ root, name });
 }
 
 fn readFileForTest(alloc: Allocator, path: []const u8) ![]u8 {
@@ -619,6 +648,19 @@ test "terminalPreview strips common terminal controls" {
     try std.testing.expectEqualStrings("hi red link", result);
 }
 
+test "trace lines encode every non-ASCII and control byte" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeTerminalSafeTraceLine(
+        &out.writer,
+        "server=bad\n\x1b]0;owned\x07\xff",
+    );
+    try std.testing.expectEqualStrings(
+        "server=bad\\x0a\\x1b]0;owned\\x07\\xff",
+        out.written(),
+    );
+}
+
 test "resolveLogPath resolves absolute and relative paths" {
     const alloc = std.testing.allocator;
     const absolute = try resolveLogPath(alloc, "/tmp/workspace", " \t/tmp/fx-absolute-trace.log\n");
@@ -627,7 +669,7 @@ test "resolveLogPath resolves absolute and relative paths" {
 
     const relative = try resolveLogPath(alloc, "/tmp/workspace", "logs/trace.log");
     defer alloc.free(relative);
-    const expected = try std.fs.path.join(alloc, &.{ "/tmp/workspace", "logs/trace.log" });
+    const expected = try std.Io.Dir.path.join(alloc, &.{ "/tmp/workspace", "logs/trace.log" });
     defer alloc.free(expected);
     try std.testing.expectEqualStrings(expected, relative);
 }

@@ -6,7 +6,6 @@ const types = @import("../shared/types.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_result_errors = @import("tool_result_errors.zig");
 const model_request_budget = @import("model_request_budget.zig");
-const session_usage = @import("../session/session_usage.zig");
 const web_search_contract = @import("web_search_contract.zig");
 const web_search_policy = @import("web_search_policy.zig");
 const web_search_provider = @import("web_search_provider.zig");
@@ -35,25 +34,23 @@ pub const Config = struct {
     clock: Clock = .{},
     policy: ?web_search_policy.WebSearchPolicy = null,
     api_key: []const u8 = "",
+    credential_source: ?types.CredentialSource = null,
     gateway_team: ?[]const u8 = null,
     worker_model: []const u8 = "",
     gateway_retry_count: usize = 3,
-    gateway_chat_url: []const u8 = "https://ai-gateway.vercel.sh/v3/ai/language-model",
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: Allocator = std.heap.c_allocator,
+    gateway_chat_url: []const u8 = "https://ai-gateway.vercel.sh/v4/ai/language-model",
 };
 
 pub const Inputs = web_search_provider.Inputs;
 
 const OwnedInputs = struct {
     api_key: []u8,
+    credential_source: ?types.CredentialSource = null,
     gateway_team: ?[]u8 = null,
     worker_model: []u8,
     gateway_retry_count: usize,
     gateway_chat_url: []u8,
     // The usage pointer and allocator borrow the parent session's lifetime.
-    usage: ?*session_usage.Usage,
-    usage_allocator: Allocator,
 
     fn deinit(self: *OwnedInputs, alloc: Allocator) void {
         alloc.free(self.api_key);
@@ -66,12 +63,11 @@ const OwnedInputs = struct {
     fn borrowed(self: *const OwnedInputs) Inputs {
         return .{
             .api_key = self.api_key,
+            .credential_source = self.credential_source,
             .gateway_team = self.gateway_team,
             .worker_model = self.worker_model,
             .gateway_retry_count = self.gateway_retry_count,
             .gateway_chat_url = self.gateway_chat_url,
-            .usage = self.usage,
-            .usage_allocator = self.usage_allocator,
         };
     }
 };
@@ -83,12 +79,11 @@ pub const Runtime = struct {
     clock: Clock,
     policy: web_search_policy.WebSearchPolicy,
     api_key: []const u8,
+    credential_source: ?types.CredentialSource = null,
     gateway_team: ?[]const u8 = null,
     worker_model: []const u8,
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
-    usage: ?*session_usage.Usage,
-    usage_allocator: Allocator,
     config_mutex: std.Io.Mutex = .init,
     fallback_cancel_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
@@ -98,12 +93,11 @@ pub const Runtime = struct {
             .clock = config.clock,
             .policy = config.policy orelse if (config.provider) |provider| provider.policy else .{},
             .api_key = config.api_key,
+            .credential_source = config.credential_source,
             .gateway_team = config.gateway_team,
             .worker_model = config.worker_model,
             .gateway_retry_count = config.gateway_retry_count,
             .gateway_chat_url = config.gateway_chat_url,
-            .usage = config.usage,
-            .usage_allocator = config.usage_allocator,
         };
     }
 
@@ -113,12 +107,11 @@ pub const Runtime = struct {
         self.config_mutex.lockUncancelable(io_mod.getIo());
         defer self.config_mutex.unlock(io_mod.getIo());
         self.api_key = inputs.api_key;
+        self.credential_source = inputs.credential_source;
         self.gateway_team = inputs.gateway_team;
         self.worker_model = inputs.worker_model;
         self.gateway_retry_count = inputs.gateway_retry_count;
         self.gateway_chat_url = inputs.gateway_chat_url;
-        self.usage = inputs.usage;
-        self.usage_allocator = inputs.usage_allocator;
     }
 
     pub fn dispatchBackend(self: *Runtime) tool_dispatch.WebSearchBackend {
@@ -191,7 +184,7 @@ pub const Runtime = struct {
         const transport_finished_at_ms = self.clock.now();
         const usage = response.usage;
         const web_search_requests = if (usage) |value| value.web_search_requests else 0;
-        recordNetworkCall(inputs.worker_model, transport_started_at_ms, transport_finished_at_ms, @intFromEnum(std.http.Status.ok), usage, response.stop_reason, "");
+        recordNetworkCall(inputs.worker_model, transport_started_at_ms, transport_finished_at_ms, @backingInt(std.http.Status.ok), usage, response.stop_reason, "");
         const results = response.takeContent();
         const duration_ms = elapsedMs(started_at_ms, self.clock.now());
         debug_trace.logf("web_search", "complete backend={s} model={s} duration_ms={d} requests={d} stop_reason={s}", .{
@@ -225,12 +218,11 @@ pub const Runtime = struct {
         const gateway_chat_url = try alloc.dupe(u8, self.gateway_chat_url);
         return .{
             .api_key = api_key,
+            .credential_source = self.credential_source,
             .gateway_team = gateway_team,
             .worker_model = worker_model,
             .gateway_retry_count = self.gateway_retry_count,
             .gateway_chat_url = gateway_chat_url,
-            .usage = self.usage,
-            .usage_allocator = self.usage_allocator,
         };
     }
 
@@ -837,22 +829,6 @@ test "web_search runtime updates its worker model during configuration" {
     try std.testing.expectEqualStrings("key", runtime.api_key);
     try std.testing.expectEqual(@as(usize, 2), runtime.gateway_retry_count);
     try std.testing.expectEqualStrings("https://gateway.test/chat", runtime.gateway_chat_url);
-}
-
-test "web_search runtime preserves session usage through worker input snapshots" {
-    const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    var runtime = Runtime.init(.{
-        .usage = &usage,
-        .usage_allocator = alloc,
-    });
-
-    var inputs = try runtime.inputsSnapshot(alloc);
-    defer inputs.deinit(alloc);
-
-    try std.testing.expect(inputs.usage.? == &usage);
-    try std.testing.expect(std.meta.eql(alloc, inputs.usage_allocator));
 }
 
 test "web_search input snapshots stay coherent during parallel reconfiguration" {

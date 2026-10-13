@@ -1,12 +1,13 @@
 const std = @import("std");
 
 const mode_contract = @import("mode_contract.zig");
-const tool_advertisement = @import("../tooling/tool_advertisement.zig");
+const tool_projection = @import("../tooling/tool_projection.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 
 pub const ModeSpec = mode_contract.ModeSpec;
+const PermissionMode = @FieldType(ModeSpec, "permission_mode");
 
 pub const Registry = struct {
     default_mode_id: []const u8,
@@ -19,18 +20,38 @@ pub const Registry = struct {
         return null;
     }
 
-    pub fn buildGatewayToolProjection(
+    /// The registered mode that applies `permission_mode`: the default mode
+    /// when it does, otherwise the first that does, or null when none does.
+    /// Sessions use it to start in the saved permission mode.
+    pub fn forPermission(self: Registry, permission_mode: PermissionMode) ?*const ModeSpec {
+        if (self.lookup(self.default_mode_id)) |mode| {
+            if (mode.permission_mode == permission_mode) return mode;
+        }
+        for (self.modes) |*mode| {
+            if (mode.permission_mode == permission_mode) return mode;
+        }
+        return null;
+    }
+
+    /// The mode a new session starts in under `permission_mode`: the mode
+    /// that applies it, or the default mode when none does.
+    pub fn startingModeId(self: Registry, permission_mode: PermissionMode) []const u8 {
+        const mode = self.forPermission(permission_mode) orelse return self.default_mode_id;
+        return mode.id;
+    }
+
+    pub fn buildModelToolProjection(
         self: Registry,
         alloc: std.mem.Allocator,
         tool_set: tool_set_contract.ToolSet,
         id: []const u8,
-        options: tool_advertisement.Options,
-    ) !tool_advertisement.EffectiveToolProjection {
+        options: tool_projection.Options,
+    ) !tool_projection.EffectiveToolProjection {
         const mode = self.lookup(id) orelse
-            return tool_advertisement.buildGatewayToolProjectionForSet(alloc, tool_set, options);
+            return tool_projection.buildModelToolProjectionForSet(alloc, tool_set, options);
         return switch (mode.tool_policy) {
-            .full => tool_advertisement.buildGatewayToolProjectionForSet(alloc, tool_set, options),
-            .read_only => tool_advertisement.buildReadOnlyGatewayToolProjectionForSet(alloc, tool_set, options),
+            .full => tool_projection.buildModelToolProjectionForSet(alloc, tool_set, options),
+            .read_only => tool_projection.buildReadOnlyModelToolProjectionForSet(alloc, tool_set, options),
         };
     }
 
@@ -84,6 +105,24 @@ test "mode registry looks up modes by id" {
     try std.testing.expect(registry.lookup("missing") == null);
 }
 
+test "mode registry finds the mode for a permission mode, preferring the default" {
+    const modes = [_]ModeSpec{
+        .{ .id = "inspect", .name = "Inspect", .permission_mode = .ask },
+        .{ .id = "ask", .name = "Ask", .permission_mode = .ask },
+        .{ .id = "apply", .name = "Apply", .permission_mode = .auto },
+    };
+    const apply_default = Registry{ .default_mode_id = "apply", .modes = modes[0..] };
+    try std.testing.expectEqualStrings("inspect", apply_default.forPermission(.ask).?.id);
+    try std.testing.expectEqualStrings("apply", apply_default.forPermission(.auto).?.id);
+    try std.testing.expect(apply_default.forPermission(.yolo) == null);
+
+    const ask_default = Registry{ .default_mode_id = "ask", .modes = modes[0..] };
+    try std.testing.expectEqualStrings("ask", ask_default.forPermission(.ask).?.id);
+
+    try std.testing.expectEqualStrings("inspect", apply_default.startingModeId(.ask));
+    try std.testing.expectEqualStrings("apply", apply_default.startingModeId(.yolo));
+}
+
 test "mode registry applies tool policy to the supplied tool set" {
     const Fixture = struct {
         fn decode(ctx: tool_dispatch.DispatchContext, _: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
@@ -106,7 +145,7 @@ test "mode registry applies tool policy to the supplied tool set" {
             .{
                 .name = "inspect",
                 .description = "Inspect",
-                .gateway_schema = .{
+                .model_schema = .{
                     .name = "inspect",
                     .description = "Inspect",
                     .input_schema = .{},
@@ -119,7 +158,7 @@ test "mode registry applies tool policy to the supplied tool set" {
             .{
                 .name = "mutate",
                 .description = "Mutate",
-                .gateway_schema = .{
+                .model_schema = .{
                     .name = "mutate",
                     .description = "Mutate",
                     .input_schema = .{},

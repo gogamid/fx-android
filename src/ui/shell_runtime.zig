@@ -9,17 +9,17 @@ const frame_layout = @import("render_engine/frame_layout.zig");
 const cursor_probe = @import("terminal/cursor_probe.zig");
 const resize_runtime = @import("resize_runtime.zig");
 const ui_terminal = @import("terminal/terminal.zig");
-const wasm_terminal = if (builtin.os.tag == .wasi) @import("terminal/wasm_terminal.zig") else struct {};
+const wasm_terminal = if (builtin.target.os.tag == .wasi) @import("terminal/wasm_terminal.zig") else struct {};
 
 const Allocator = std.mem.Allocator;
 const Layout = types.Layout;
 const Metrics = types.Metrics;
 const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 
-const TmuxHistoryClearRunner = *const fn (Allocator, []const u8) anyerror!void;
+const TmuxHistoryClearRunner = *const fn (Allocator, []const []const u8) anyerror!void;
 var tmux_history_clear_test_runner: if (builtin.is_test) ?TmuxHistoryClearRunner else void = if (builtin.is_test) null else {};
 
-const supports_test_pty = switch (builtin.os.tag) {
+const supports_test_pty = switch (builtin.target.os.tag) {
     .linux,
     .macos,
     .freebsd,
@@ -35,7 +35,7 @@ extern "c" fn unlockpt(fd: c_int) c_int;
 extern "c" fn ptsname(fd: c_int) ?[*:0]u8;
 
 pub const supports_resize_signal = resize_runtime.supports_resize_signal;
-pub const ResizeHandler = if (builtin.os.tag == .wasi)
+pub const ResizeHandler = if (builtin.target.os.tag == .wasi)
     *const fn () callconv(.c) void
 else
     std.posix.Sigaction.handler_fn;
@@ -59,8 +59,6 @@ pub const AlternateScreenOwner = enum {
     file_approval,
     full_transcript,
     catalog_menu,
-    subagent_manager,
-    terminal_session,
 };
 
 pub const TerminalState = struct {
@@ -85,35 +83,29 @@ pub const TerminalState = struct {
         return self.alternate_screen_owner == .catalog_menu;
     }
 
-    pub fn subagentManagerScreenActive(self: TerminalState) bool {
-        return self.alternate_screen_owner == .subagent_manager;
-    }
-
-    pub fn terminalSessionScreenActive(self: TerminalState) bool {
-        return self.alternate_screen_owner == .terminal_session;
-    }
-
     pub fn ensureInteractive(self: TerminalState) !void {
-        if (comptime builtin.os.tag == .wasi) return;
+        if (comptime builtin.target.os.tag == .wasi) return;
         if (std.c.isatty(self.stdin_fd) == 0 or std.c.isatty(std.posix.STDOUT_FILENO) == 0) {
             return error.NotATerminal;
         }
     }
 
     pub fn captureOriginalTermios(self: *TerminalState) !void {
-        if (comptime builtin.os.tag == .wasi) return;
-        self.original_termios = try std.posix.tcgetattr(self.stdin_fd);
+        if (comptime builtin.target.os.tag == .wasi) return;
+        self.original_termios = try io_mod.tcgetattr(self.stdin_fd);
     }
 
     pub fn enableRawMode(self: *TerminalState) !void {
-        if (comptime builtin.os.tag == .wasi) {
+        if (comptime builtin.target.os.tag == .wasi) {
             self.raw_enabled = true;
             return;
         }
         var raw = self.original_termios;
 
         raw.iflag.BRKINT = false;
+        raw.iflag.IGNCR = false;
         raw.iflag.ICRNL = false;
+        raw.iflag.INLCR = false;
         raw.iflag.INPCK = false;
         raw.iflag.ISTRIP = false;
         raw.iflag.IXON = false;
@@ -133,14 +125,14 @@ pub const TerminalState = struct {
             raw.cc[vtime_idx] = 0;
         }
 
-        try std.posix.tcsetattr(self.stdin_fd, .NOW, raw);
+        try io_mod.tcsetattr(self.stdin_fd, .NOW, raw);
         self.raw_enabled = true;
     }
 
     pub fn disableRawMode(self: *TerminalState) void {
         if (!self.raw_enabled) return;
-        if (comptime builtin.os.tag != .wasi) {
-            std.posix.tcsetattr(self.stdin_fd, .FLUSH, self.original_termios) catch {};
+        if (comptime builtin.target.os.tag != .wasi) {
+            io_mod.tcsetattr(self.stdin_fd, .FLUSH, self.original_termios) catch {};
         }
         self.raw_enabled = false;
     }
@@ -169,14 +161,14 @@ pub const TerminalState = struct {
     }
 
     pub fn queryLayout(self: TerminalState, footer_rows: u16) !Layout {
-        return if (comptime builtin.os.tag == .wasi)
+        return if (comptime builtin.target.os.tag == .wasi)
             wasm_terminal.queryLayout(footer_rows)
         else
             ui_terminal.queryLayout(self.stdin_fd, footer_rows);
     }
 
     pub fn queryCursorPosition(self: TerminalState) !CursorPosition {
-        if (comptime builtin.os.tag == .wasi) {
+        if (comptime builtin.target.os.tag == .wasi) {
             // JavaScript hosts provide a fresh terminal surface rather than an
             // existing shell viewport, so there are no launch rows to preserve.
             return .{ .row = 1, .col = 1 };
@@ -248,14 +240,14 @@ pub const TerminalState = struct {
     }
 
     pub fn read(self: TerminalState, out: []u8) !usize {
-        if (comptime builtin.os.tag == .wasi) {
+        if (comptime builtin.target.os.tag == .wasi) {
             return std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{out});
         }
         return std.posix.read(self.stdin_fd, out);
     }
 
     pub fn pollInput(self: TerminalState, timeout_ms: i32) !PollResult {
-        if (comptime builtin.os.tag == .wasi) {
+        if (comptime builtin.target.os.tag == .wasi) {
             return switch (wasm_terminal.pollInput(timeout_ms)) {
                 1 => .{ .readable = true },
                 -1 => .{ .hung_up = true },
@@ -313,11 +305,20 @@ fn tmuxScreenIsClear(alloc: Allocator, pane: []const u8) !bool {
 }
 
 fn runTmuxHistoryClear(alloc: Allocator, pane: []const u8) !void {
+    // clear-history also dismisses tmux pane modes. In particular, choose-tree
+    // zooms a split pane and triggers our resize reset while the chooser is open.
+    // Decide inside tmux, not with a separate client-side mode query. -C runs
+    // tmux commands, not a shell; only tmux's own pane_id enters command text.
+    // Keep the explicit target: nested commands need not inherit run-shell's -t.
+    const argv = [_][]const u8{
+        "tmux",                                          "run-shell", "-C", "-t", pane,
+        "#{?pane_in_mode,,clear-history -t #{pane_id}}",
+    };
     if (comptime builtin.is_test) {
-        if (tmux_history_clear_test_runner) |runner| return runner(alloc, pane);
+        if (tmux_history_clear_test_runner) |runner| return runner(alloc, &argv);
     }
     const result = try std.process.run(alloc, io_mod.getIo(), .{
-        .argv = &.{ "tmux", "clear-history", "-t", pane },
+        .argv = &argv,
     });
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
@@ -326,7 +327,7 @@ fn runTmuxHistoryClear(alloc: Allocator, pane: []const u8) !void {
 
 var tmux_history_clear_test_calls: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
 
-fn failTmuxHistoryClearForTest(_: Allocator, _: []const u8) !void {
+fn failTmuxHistoryClearForTest(_: Allocator, _: []const []const u8) !void {
     tmux_history_clear_test_calls += 1;
     return error.TestTmuxHistoryClearFailure;
 }
@@ -337,6 +338,28 @@ test "tmux history clear failure does not escape the reset boundary" {
     defer tmux_history_clear_test_runner = null;
 
     clearTmuxHistoryForPane(std.testing.allocator, "%1");
+
+    try std.testing.expectEqual(@as(usize, 1), tmux_history_clear_test_calls);
+}
+
+fn expectModeSafeTmuxHistoryClearForTest(_: Allocator, argv: []const []const u8) !void {
+    tmux_history_clear_test_calls += 1;
+    const expected = [_][]const u8{
+        "tmux",                                          "run-shell", "-C", "-t", "%42",
+        "#{?pane_in_mode,,clear-history -t #{pane_id}}",
+    };
+    try std.testing.expectEqual(expected.len, argv.len);
+    for (expected, argv) |want, actual| {
+        try std.testing.expectEqualStrings(want, actual);
+    }
+}
+
+test "tmux history clear preserves pane modes with a server-owned target" {
+    tmux_history_clear_test_calls = 0;
+    tmux_history_clear_test_runner = expectModeSafeTmuxHistoryClearForTest;
+    defer tmux_history_clear_test_runner = null;
+
+    try runTmuxHistoryClear(std.testing.allocator, "%42");
 
     try std.testing.expectEqual(@as(usize, 1), tmux_history_clear_test_calls);
 }
@@ -406,6 +429,28 @@ pub fn focusedToolActivityKind(
 
 pub fn activeToolActivityCount(shell: anytype) usize {
     return shell.activeToolActivityCount();
+}
+
+pub fn presentActiveToolCancellation(
+    alloc: Allocator,
+    shell: anytype,
+) !bool {
+    const Shell = @TypeOf(shell.*);
+    if (comptime !@hasDecl(Shell, "presentActiveToolCancellation")) {
+        return false;
+    }
+    return shell.presentActiveToolCancellation(alloc);
+}
+
+pub fn writeTurnCancellation(
+    alloc: Allocator,
+    shell: anytype,
+    metrics: *Metrics,
+    record: bool,
+) !void {
+    const Shell = @TypeOf(shell.*);
+    if (comptime !@hasDecl(Shell, "writeTurnCancellation")) return;
+    try shell.writeTurnCancellation(alloc, metrics, record);
 }
 
 pub fn requestRedraw(
@@ -526,7 +571,7 @@ fn historyResetUsesRisForValues(term_program: ?[]const u8, tmux: ?[]const u8) bo
 }
 
 fn vminIndex() usize {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .linux => 6,
         .macos, .ios, .tvos, .watchos, .visionos => 16,
         .freebsd, .netbsd, .dragonfly, .openbsd => 16,
@@ -535,7 +580,7 @@ fn vminIndex() usize {
 }
 
 fn vtimeIndex() usize {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .linux => 5,
         .macos, .ios, .tvos, .watchos, .visionos => 17,
         .freebsd, .netbsd, .dragonfly, .openbsd => 17,
@@ -598,7 +643,7 @@ test "enableRawMode preserves already queued input" {
     const pty = try TestPty.open();
     defer pty.close();
 
-    var original = try std.posix.tcgetattr(pty.slave);
+    var original = try io_mod.tcgetattr(pty.slave);
     original.lflag.ECHO = false;
     original.lflag.ICANON = false;
     original.lflag.ISIG = false;
@@ -608,7 +653,7 @@ test "enableRawMode preserves already queued input" {
         original.cc[vmin_idx] = 1;
         original.cc[vtime_idx] = 0;
     }
-    try std.posix.tcsetattr(pty.slave, .NOW, original);
+    try io_mod.tcsetattr(pty.slave, .NOW, original);
 
     var terminal = TerminalState{ .stdin_fd = pty.slave };
     try terminal.captureOriginalTermios();
@@ -633,6 +678,47 @@ test "enableRawMode preserves already queued input" {
     var buf: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), try std.posix.read(pty.slave, &buf));
     try std.testing.expectEqual(@as(u8, 3), buf[0]);
+}
+
+test "enableRawMode preserves carriage return input" {
+    if (!supports_test_pty) return error.SkipZigTest;
+
+    const pty = try TestPty.open();
+    defer pty.close();
+
+    var original = try io_mod.tcgetattr(pty.slave);
+    original.iflag.IGNCR = true;
+    original.iflag.ICRNL = true;
+    original.iflag.INLCR = true;
+    try io_mod.tcsetattr(pty.slave, .NOW, original);
+
+    var terminal = TerminalState{ .stdin_fd = pty.slave };
+    try terminal.captureOriginalTermios();
+    try terminal.enableRawMode();
+    defer terminal.disableRawMode();
+
+    const raw = try io_mod.tcgetattr(pty.slave);
+    try std.testing.expect(!raw.iflag.IGNCR);
+    try std.testing.expect(!raw.iflag.ICRNL);
+    try std.testing.expect(!raw.iflag.INLCR);
+
+    const enter = [_]u8{'\r'};
+    try (std.Io.File{
+        .handle = pty.master,
+        .flags = .{ .nonblocking = false },
+    }).writeStreamingAll(io_mod.getIo(), &enter);
+
+    var fds = [_]std.posix.pollfd{.{
+        .fd = pty.slave,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&fds, 100));
+    try std.testing.expect((fds[0].revents & std.posix.POLL.IN) != 0);
+
+    var buf: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try std.posix.read(pty.slave, &buf));
+    try std.testing.expectEqual(@as(u8, '\r'), buf[0]);
 }
 
 test "reconstructive paint re-emits a full transcript in order" {

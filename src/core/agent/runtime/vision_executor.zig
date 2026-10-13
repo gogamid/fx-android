@@ -4,7 +4,6 @@ const agent_stream_provider = @import("../stream_provider.zig");
 const context_limits = @import("../../config/context_limits.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
-const session_usage = @import("../../session/session_usage.zig");
 const types = @import("../../shared/types.zig");
 const image_provider = @import("image_provider.zig");
 const tool_contracts = @import("tool_contracts.zig");
@@ -32,10 +31,7 @@ pub const Config = struct {
     gateway_team: ?[]const u8,
     session_id: ?[]const u8 = null,
     retry_count: usize,
-    chat_url: []const u8,
     cancel_flag: ?*std.atomic.Value(bool),
-    usage: ?*session_usage.Usage,
-    usage_allocator: Allocator,
     trace_ctx: debug_trace.TraceContext,
     output_limit: context_limits.Resolved,
 };
@@ -273,6 +269,17 @@ fn runBatchAttempt(
     config: Config,
 ) !BatchAttempt {
     const output_limit_bytes = config.output_limit.effectiveBytes();
+    var parsed_schema = std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        response_schema,
+        .{},
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidStructuredResponseSchema,
+    };
+    defer parsed_schema.deinit();
+    if (parsed_schema.value != .object) return error.InvalidStructuredResponseSchema;
     var provider_result = image_provider.inspect(
         alloc,
         system_prompt,
@@ -285,10 +292,7 @@ fn runBatchAttempt(
             .gateway_team = config.gateway_team,
             .session_id = config.session_id,
             .retry_count = config.retry_count,
-            .chat_url = config.chat_url,
             .cancel_flag = cancel_flag,
-            .usage = config.usage,
-            .usage_allocator = config.usage_allocator,
             .trace_ctx = config.trace_ctx,
             .capture_limit_bytes = @min(
                 output_limit_bytes +| 1,
@@ -297,7 +301,7 @@ fn runBatchAttempt(
             .response_format = .{
                 .name = vision_contracts.provider_response_format_name,
                 .description = vision_contracts.provider_response_format_description,
-                .schema_json = response_schema,
+                .schema = parsed_schema.value,
             },
         },
     ) catch |err| switch (err) {
@@ -378,8 +382,7 @@ fn runBatchAttempt(
 
 fn failedArguments(alloc: Allocator, err: anyerror) !tool_contracts.ToolExecutionResult {
     return .{
-        .model_output = try std.fmt.allocPrint(
-            alloc,
+        .model_output = try alloc.print(
             "Vision request rejected before image access: {s}",
             .{@errorName(err)},
         ),

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -10,16 +10,17 @@ import { fileURLToPath } from "node:url";
 const require = createRequire(import.meta.url);
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const addonPath = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/lib/libfx.node"));
-const traceChild = process.env.LIBFX_STALE_TRACE_CHILD === "1";
-if (!traceChild) {
+const ambientTraceChild = process.env.LIBFX_AMBIENT_TRACE_CHILD === "1";
+if (!ambientTraceChild) {
   delete process.env.FX_TRACE;
   delete process.env.FX_TRACE_LOG;
   delete process.env.FX_TRACE_SCOPES;
   delete process.env.FX_TRACE_STDERR;
 }
 const addon = require(addonPath);
+assert.equal(typeof addon.coreFetchDisposition, "function", "rebuild libfx.node with coreFetchDisposition before running this suite");
 
-if (traceChild) {
+if (ambientTraceChild) {
   const traceCore = addon.createCore({
     apiKey: "trace-test-key",
     home: "/tmp",
@@ -36,12 +37,18 @@ if (traceChild) {
 
 for (const [name, args] of [
   ["createCore", []],
+  ["takeCoreReadyFd", []],
   ["writeCore", []],
   ["writeCore", [{}]],
   ["closeCore", []],
   ["drainCore", []],
+  ["writeCoreAttachment", []],
+  ["writeCoreAttachment", [{}, 1]],
+  ["takeCoreAttachment", []],
+  ["discardCoreAttachments", []],
   ["takeCoreFetch", []],
   ["coreFetchActive", []],
+  ["coreFetchDisposition", []],
   ["startCoreFetchResponse", []],
   ["pushCoreFetchResponse", []],
   ["finishCoreFetch", []],
@@ -83,6 +90,7 @@ for (const fakeHandle of [null, undefined, {}, Buffer.alloc(0), 0, "handle"]) {
     () => addon.coreExited(fakeHandle),
     (error) => error instanceof TypeError || error.code === "LIBFX_INVALID_ARGUMENT" || error.code === "LIBFX_NAPI",
   );
+  assert.throws(() => addon.coreFetchDisposition(fakeHandle, 1), { name: "TypeError" });
 }
 
 const core = addon.createCore({ apiKey: "misuse-test-key", home: "/tmp", workspaceRoot: "/tmp" });
@@ -91,12 +99,37 @@ assert.throws(
   (error) => error.code === "LIBFX_NATIVE_BACKPRESSURE",
 );
 addon.writeCore(core, Buffer.alloc(0));
+// Attachments carry raw prompt images and checkpoints beside ACP frames.
+for (const id of [0, -1, 1.5, 2 ** 32, "1"]) {
+  assert.throws(() => addon.writeCoreAttachment(core, id, Buffer.from("x")), {
+    name: "TypeError",
+    code: "LIBFX_INVALID_ARGUMENT",
+  });
+}
+assert.throws(
+  () => addon.writeCoreAttachment(core, 1, Buffer.alloc(4 * 1024 * 1024 + 1)),
+  (error) => error.code === "LIBFX_INVALID_ARGUMENT",
+);
+addon.writeCoreAttachment(core, 1, Buffer.from("first"));
+assert.throws(
+  () => addon.writeCoreAttachment(core, 1, Buffer.from("again")),
+  (error) => error.code === "LIBFX_INVALID_ARGUMENT" && /already pending/.test(error.message),
+);
+for (let id = 2; id <= 8; id++) addon.writeCoreAttachment(core, id, Buffer.from("x"));
+assert.throws(
+  () => addon.writeCoreAttachment(core, 9, Buffer.from("x")),
+  (error) => error.code === "LIBFX_NATIVE_BACKPRESSURE",
+);
+addon.discardCoreAttachments(core);
+addon.writeCoreAttachment(core, 9, Buffer.from("after discard"));
+assert.equal(addon.takeCoreAttachment(core, 9), null, "inbound payloads are never handed back to JavaScript");
 addon.closeCore(core);
 addon.destroyCore(core);
 assert.throws(
   () => addon.coreExited(core),
   (error) => error.code === "LIBFX_NATIVE_CLOSED",
 );
+assert.throws(() => addon.coreFetchDisposition(core, 1), (error) => error.code === "LIBFX_NATIVE_CLOSED");
 
 const lifecycleCore = addon.createCore({
   apiKey: "lifecycle-test-key",
@@ -135,8 +168,14 @@ const request = async (method, params = {}) => {
 };
 const takeFetch = async () => {
   for (;;) {
-    const bytes = addon.takeCoreFetch(lifecycleCore);
-    if (bytes) return JSON.parse(bytes.toString("utf8"));
+    const fetchRequest = addon.takeCoreFetch(lifecycleCore);
+    if (fetchRequest) {
+      // Metadata stays JSON; the body arrives as raw bytes beside it.
+      const metadata = JSON.parse(fetchRequest.request.toString("utf8"));
+      assert.equal(Object.hasOwn(metadata, "body"), false, "fetch metadata must not embed the body");
+      assert.ok(Buffer.isBuffer(fetchRequest.body), "fetch body must be a Buffer");
+      return { ...metadata, body: fetchRequest.body };
+    }
     await new Promise((resolveWait) => setTimeout(resolveWait, 2));
   }
 };
@@ -156,22 +195,50 @@ try {
   const sessionId = created.result.sessionId;
 
   const firstPrompt = sendPrompt(sessionId, "first low-level prompt");
+  const catalogFetch = await Promise.race([takeFetch(), timeout("model catalog fetch")]);
+  assert.equal(catalogFetch.method, "GET");
+  assert.equal(catalogFetch.url, "https://ai-gateway.vercel.sh/coding-agent/v1/models");
+  assert.equal(addon.startCoreFetchResponse(lifecycleCore, catalogFetch.handle, 200), 1);
+  assert.equal(addon.pushCoreFetchResponse(lifecycleCore, catalogFetch.handle, Buffer.from(JSON.stringify({
+    object: "list", data: [{ id: "native/test-model", type: "language" }],
+  }))), 1);
+  assert.equal(addon.finishCoreFetch(lifecycleCore, catalogFetch.handle), 1);
   const firstFetch = await Promise.race([takeFetch(), timeout("first host fetch")]);
+  assert.equal(catalogFetch.body.length, 0);
+  assert.equal(firstFetch.method, "POST");
+  assert.equal(firstFetch.url, "http://127.0.0.1:31337/chat");
+  assert.ok(Array.isArray(JSON.parse(firstFetch.body.toString("utf8")).prompt), "fetch body must be the raw model request");
   assert.ok(Number.isInteger(firstFetch.handle) && firstFetch.handle > 0, "fetch request must carry a positive handle");
   const firstHandle = firstFetch.handle;
   const futureHandle = firstHandle + 1;
   assert.equal(addon.coreFetchActive(lifecycleCore, firstHandle), true);
   assert.equal(addon.coreFetchActive(lifecycleCore, futureHandle), false);
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, firstHandle), 1, "the exact live handle must be active");
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, futureHandle), 0, "a different positive handle must be retired, never active or consumed");
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, 0x7fffffff), 0, "the maximum positive int32 handle must remain exact");
+  assert.throws(() => addon.coreFetchDisposition(lifecycleCore), {
+    name: "TypeError", code: "LIBFX_INVALID_ARGUMENT", message: "missing required argument",
+  });
+  for (const invalidHandle of [0, -1, 1.5, NaN, Infinity, -Infinity, 0x80000000, 0x100000000 + firstHandle, null, undefined, {}, String(firstHandle), 1n]) {
+    assert.throws(() => addon.coreFetchDisposition(lifecycleCore, invalidHandle), {
+      name: "TypeError", code: "LIBFX_INVALID_ARGUMENT",
+    });
+  }
   assert.equal(addon.startCoreFetchResponse(lifecycleCore, futureHandle, 200), 0);
   assert.equal(addon.coreFetchActive(lifecycleCore, firstHandle), true, "stale start must not mutate the active handle");
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, firstHandle), 1, "invalid or stale handles must not mutate the live disposition");
   assert.equal(addon.startCoreFetchResponse(lifecycleCore, firstHandle, 200), 1);
   assert.equal(addon.pushCoreFetchResponse(lifecycleCore, firstHandle, Buffer.alloc(8 * 1024 * 1024 + 1)), 2);
   assert.equal(addon.pushCoreFetchResponse(lifecycleCore, firstHandle, responseBytes("first")), 1);
   assert.equal(addon.finishCoreFetch(lifecycleCore, firstHandle), 1);
   assert.equal((await Promise.race([waitForResponse(firstPrompt), timeout("first prompt result")])).result.stopReason, "end_turn");
+  assert.equal(addon.coreFetchActive(lifecycleCore, firstHandle), false);
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, firstHandle), 2, "logical consumption must survive the normal fetch close");
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, futureHandle), 0, "consumption must not grant a future handle");
 
   const secondPrompt = sendPrompt(sessionId, "second low-level prompt");
   const secondFetch = await Promise.race([takeFetch(), timeout("second host fetch")]);
+  assert.equal(secondFetch.method, "POST");
   assert.notEqual(secondFetch.handle, firstHandle, "sequential fetches must use unique handles");
   const secondHandle = secondFetch.handle;
   assert.equal(addon.startCoreFetchResponse(lifecycleCore, firstHandle, 200), 0);
@@ -179,13 +246,19 @@ try {
   assert.equal(addon.finishCoreFetch(lifecycleCore, firstHandle), 0);
   assert.equal(addon.failCoreFetch(lifecycleCore, firstHandle), 0);
   assert.equal(addon.coreFetchActive(lifecycleCore, secondHandle), true, "stale operations must not mutate the newer handle");
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, secondHandle), 1, "the next handle must not inherit earlier consumption");
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, firstHandle), 2, "the previous exact consumed identity must survive until replaced");
   assert.equal(addon.startCoreFetchResponse(lifecycleCore, secondHandle, 200), 1);
   assert.equal(addon.pushCoreFetchResponse(lifecycleCore, secondHandle, responseBytes("second")), 1);
   assert.equal(addon.finishCoreFetch(lifecycleCore, secondHandle), 1);
   assert.equal((await Promise.race([waitForResponse(secondPrompt), timeout("second prompt result")])).result.stopReason, "end_turn");
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, firstHandle), 0, "new consumption replaces only the previous consumed identity");
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, secondHandle), 2);
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, secondHandle + 1), 0);
 
   for (const [name, args] of [
     ["coreFetchActive", [lifecycleCore, 0]],
+    ["coreFetchDisposition", [lifecycleCore, 0]],
     ["startCoreFetchResponse", [lifecycleCore, 0, 200]],
     ["pushCoreFetchResponse", [lifecycleCore, 0, Buffer.alloc(0)]],
     ["finishCoreFetch", [lifecycleCore, 0]],
@@ -196,34 +269,44 @@ try {
       code: "LIBFX_INVALID_ARGUMENT",
     });
   }
+
+  addon.closeCore(lifecycleCore);
+  await Promise.race([(async () => {
+    while (!addon.coreExited(lifecycleCore)) await new Promise((resolveWait) => setTimeout(resolveWait, 2));
+  })(), timeout("normal core close")]);
+  assert.equal(addon.coreExitCode(lifecycleCore), 0);
+  assert.equal(addon.coreFetchActive(lifecycleCore, secondHandle), false);
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, secondHandle), 2, "normal core shutdown must retain the exact consumed identity");
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, secondHandle + 1), 0);
+  addon.abortCoreFetch(lifecycleCore);
+  assert.equal(addon.coreFetchDisposition(lifecycleCore, secondHandle), 0, "explicit cancellation must revoke consumption even after normal close");
+  assert.equal(addon.coreFetchActive(lifecycleCore, secondHandle), false);
 } finally {
   addon.closeCore(lifecycleCore);
   addon.destroyCore(lifecycleCore);
 }
 
-const traceDir = mkdtempSync(resolve(tmpdir(), "libfx-stale-trace-"));
+const traceDir = mkdtempSync(resolve(tmpdir(), "libfx-ambient-trace-"));
 const traceLog = resolve(traceDir, "trace.log");
 try {
-  const traced = spawnSync(process.execPath, [fileURLToPath(import.meta.url), addonPath], {
+  const isolated = spawnSync(process.execPath, [fileURLToPath(import.meta.url), addonPath], {
     cwd: process.cwd(),
     encoding: "utf8",
     env: {
       ...process.env,
-      LIBFX_STALE_TRACE_CHILD: "1",
+      LIBFX_AMBIENT_TRACE_CHILD: "1",
+      FX_TRACE: "1",
       FX_TRACE_LOG: traceLog,
-      FX_TRACE_SCOPES: "napi",
+      FX_TRACE_SCOPES: "napi,acp,interrupt",
+      FX_TRACE_STDERR: "1",
     },
   });
-  assert.equal(traced.status, 0, traced.stderr || traced.stdout);
-  assert.equal(traced.stdout, "", "stale tracing must not change normal stdout");
-  assert.equal(traced.stderr, "", "file tracing must not write stderr");
-  const trace = readFileSync(traceLog, "utf8");
-  const staleLines = trace.split("\n").filter((line) => line.includes("dropping stale host fetch"));
-  assert.equal(staleLines.length, 1, "one stale operation must emit one bounded trace");
-  assert.match(staleLines[0], /operation=push handle=17 reason=no_active_fetch/);
-  assert.doesNotMatch(trace, /secret-response-payload/);
+  assert.equal(isolated.status, 0, isolated.stderr || isolated.stdout);
+  assert.equal(isolated.stdout, "", "ambient fx tracing must not change libfx stdout");
+  assert.equal(isolated.stderr, "", "ambient fx tracing must not change libfx stderr");
+  assert.equal(existsSync(traceLog), false, "ambient fx tracing must not create a libfx trace file");
 } finally {
   rmSync(traceDir, { recursive: true, force: true });
 }
 
-console.log("native core misuse passed: argument, handle, stale, trace, backpressure, and closed-handle checks are enforced");
+console.log("native core misuse passed: argument, exact-handle disposition, consumed persistence, cancellation revocation, stale, ambient trace isolation, backpressure, and closed-handle checks are enforced");

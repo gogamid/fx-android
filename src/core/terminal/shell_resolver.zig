@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 const command_environment = @import("../execution/command_environment.zig");
@@ -14,29 +15,29 @@ pub const ResolveError = error{
 pub const Profile = command_environment.Profile;
 pub const Environment = command_environment.Environment;
 
-const ShellKind = enum { bash, zsh };
+pub const ShellKind = enum { bash, zsh };
 
-fn shellKind(path: []const u8) ?ShellKind {
-    const basename = std.fs.path.basename(path);
+pub fn shellKind(path: []const u8) ?ShellKind {
+    const basename = std.Io.Dir.path.basename(path);
     if (std.mem.eql(u8, basename, "bash")) return .bash;
     if (std.mem.eql(u8, basename, "zsh")) return .zsh;
     return null;
 }
 
 fn fallbackLoginShell() []const u8 {
-    return if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/bash";
+    return if (builtin.target.os.tag == .macos) "/bin/zsh" else "/bin/bash";
 }
 
 fn supportedLoginShell(configured_login_shell: ?[]const u8) ResolveError![]const u8 {
     const path = configured_login_shell orelse return error.MissingLoginShell;
-    if (!std.fs.path.isAbsolute(path)) return error.RelativeShellPath;
+    if (!std.Io.Dir.path.isAbsolute(path)) return error.RelativeShellPath;
     if (shellKind(path) != null) return path;
     return fallbackLoginShell();
 }
 
 pub const Invocation = struct {
     path: []const u8,
-    values: [6][]const u8 = @splat(""),
+    values: [8][]const u8 = @splat(""),
     len: usize = 0,
 
     pub fn argv(self: *const Invocation) []const []const u8 {
@@ -72,7 +73,7 @@ pub fn resolve(
             .clean_start = value.clean_start,
         },
     };
-    if (!std.fs.path.isAbsolute(selection.path)) {
+    if (!std.Io.Dir.path.isAbsolute(selection.path)) {
         return error.RelativeShellPath;
     }
 
@@ -103,7 +104,7 @@ pub fn resolve(
 }
 
 pub fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
-    if (comptime !builtin.link_libc or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime !builtin.link_libc or builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return null;
     }
     var entry: std.c.passwd = undefined;
@@ -141,6 +142,21 @@ pub fn environment(
     };
 }
 
+pub fn environmentForShellSpec(
+    alloc: Allocator,
+    configured_login_shell: ?[]const u8,
+    shell: contracts.ShellSpec,
+) (ResolveError || Allocator.Error)!Environment {
+    const invocation = try resolve(configured_login_shell, shell);
+    return switch (shell) {
+        .user_login => .{ .user = try alloc.dupe(u8, invocation.path) },
+        .executable => |value| if (value.clean_start)
+            .{ .clean = try alloc.dupe(u8, invocation.path) }
+        else
+            .{ .user = try alloc.dupe(u8, invocation.path) },
+    };
+}
+
 pub fn profileShell(
     alloc: Allocator,
     configured_login_shell: ?[]const u8,
@@ -167,7 +183,13 @@ pub fn profileShell(
     };
 }
 
-pub fn capturedInvocation(environment_value: Environment, command: []const u8) ResolveError!Invocation {
+const captured_zsh_user_prelude = "\\builtin trap - TERM; ";
+
+pub fn capturedInvocation(
+    alloc: Allocator,
+    environment_value: Environment,
+    command: []const u8,
+) (ResolveError || Allocator.Error)!Invocation {
     switch (environment_value) {
         .legacy, .workspace_clean => return error.UnsupportedShell,
         .clean => |path| {
@@ -181,15 +203,151 @@ pub fn capturedInvocation(environment_value: Environment, command: []const u8) R
         },
         .user => |path| {
             var invocation = try resolve(path, .user_login);
-            if (std.mem.eql(u8, std.fs.path.basename(path), "bash")) {
+            if (std.mem.eql(u8, std.Io.Dir.path.basename(path), "bash")) {
                 removeInteractiveFlag(&invocation);
                 invocation.append("-O");
                 invocation.append("expand_aliases");
             }
-            invocation.setCommand(command);
+            const effective_command = if (shellKind(path) == .zsh)
+                try std.mem.concat(alloc, u8, &.{ captured_zsh_user_prelude, command })
+            else
+                command;
+            invocation.setCommand(effective_command);
             return invocation;
         },
     }
+}
+
+/// Stderr marker, followed by a nonce, that a snapshot bootstrap writes with
+/// exit status 125 when the replay stopped before the command could start.
+pub const snapshot_replay_failure_prefix = "fx-shell-snapshot-replay-failed:";
+
+/// Builds the clean-shell argv for a snapshot run. The shell sources the
+/// replay and the command from stdin, so no snapshot text or command appears
+/// in argv. `failure_marker` reaches stderr, with exit status 125, only when
+/// the replay stopped before the command started.
+pub fn snapshotInvocation(
+    alloc: Allocator,
+    shell_path: []const u8,
+    failure_marker: []const u8,
+) (ResolveError || Allocator.Error)!Invocation {
+    const kind = shellKind(shell_path) orelse return error.UnsupportedShell;
+    var invocation = Invocation{ .path = shell_path };
+    invocation.append(shell_path);
+    switch (kind) {
+        .zsh => invocation.append("-f"),
+        .bash => {
+            invocation.append("--noprofile");
+            invocation.append("--norc");
+            invocation.append("-O");
+            invocation.append("expand_aliases");
+        },
+    }
+    var bootstrap: std.ArrayList(u8) = .empty;
+    errdefer bootstrap.deinit(alloc);
+    try bootstrap.appendSlice(
+        alloc,
+        "\\builtin source /dev/fd/0; __fx_snapshot_status=$?; " ++
+            "if [[ -z ${__fx_snapshot_restored-} ]]; then \\builtin printf '%s' ",
+    );
+    try appendShellWord(&bootstrap, alloc, failure_marker);
+    // Re-raise the common termination signals so the supervisor reports a
+    // signal, as it does when the shell runs the command directly.
+    try bootstrap.appendSlice(
+        alloc,
+        " >&2; \\builtin exit 125; fi; " ++
+            "case $__fx_snapshot_status in 129|130|137|143) " ++
+            "\\builtin kill -$((__fx_snapshot_status - 128)) $$;; esac; " ++
+            "\\builtin exit $__fx_snapshot_status",
+    );
+    invocation.setCommand(try bootstrap.toOwnedSlice(alloc));
+    return invocation;
+}
+
+/// Builds the stdin script for a snapshot run: the replay, the restored flag
+/// the bootstrap checks, and the command. The command is single-quoted so it
+/// is parsed only when `eval` runs, after the replayed aliases exist, and it
+/// runs with stdin from /dev/null so it cannot read the rest of the script.
+pub fn snapshotScript(
+    alloc: Allocator,
+    replay: []const u8,
+    command: []const u8,
+) Allocator.Error![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(alloc);
+    try output.appendSlice(alloc, replay);
+    if (replay.len != 0 and replay[replay.len - 1] != '\n') try output.append(alloc, '\n');
+    try output.appendSlice(alloc, "__fx_snapshot_restored=1\n\\builtin eval -- ");
+    try appendShellWord(&output, alloc, command);
+    try output.appendSlice(alloc, " </dev/null\n");
+    return output.toOwnedSlice(alloc);
+}
+
+/// Payload section markers written by `snapshotCaptureScript`. Each marker is
+/// followed by `:` and the capture nonce.
+pub const snapshot_marker_prefix = "FXSNAP:";
+
+const zsh_capture_script =
+    \\{
+    \\\builtin zmodload zsh/parameter 2>/dev/null
+    \\\builtin printf 'FXSNAP:@NONCE@:ENV\0'
+    \\/usr/bin/env -0
+    \\\builtin printf 'FXSNAP:@NONCE@:NAMES\0'
+    \\\builtin printf '%s\0' ${(k)aliases} ${(k)galiases} ${(k)saliases} ${(k)functions}
+    \\\builtin printf 'FXSNAP:@NONCE@:REPLAY\0'
+    \\\builtin typeset -p fpath
+    \\for __fx_snapshot_name in ${(ko)functions}; do
+    \\  case $__fx_snapshot_name in (_*|prompt_*|__fx_snapshot_*) continue;; esac
+    \\  \builtin functions -- $__fx_snapshot_name
+    \\done
+    \\\builtin alias -L
+    \\\builtin alias -sL
+    \\for __fx_snapshot_name in extendedglob globdots nullglob nomatch kshglob shglob globstarshort bareglobqual caseglob numericglobsort rcexpandparam shwordsplit ksharrays magicequalsubst equals braceccl rcquotes shortloops cshnullglob globsubst; do
+    \\  if [[ -o $__fx_snapshot_name ]]; then
+    \\    \builtin print -r -- "\\builtin setopt $__fx_snapshot_name"
+    \\  else
+    \\    \builtin print -r -- "\\builtin unsetopt $__fx_snapshot_name"
+    \\  fi
+    \\done
+    \\\builtin printf '\0FXSNAP:@NONCE@:END\0'
+    \\} 2>/dev/null
+;
+
+const bash_capture_script =
+    \\{
+    \\\builtin printf 'FXSNAP:@NONCE@:ENV\0'
+    \\/usr/bin/env -0
+    \\\builtin printf 'FXSNAP:@NONCE@:NAMES\0'
+    \\\builtin printf '%s\0' $(\builtin compgen -a) $(\builtin compgen -A function)
+    \\\builtin printf 'FXSNAP:@NONCE@:REPLAY\0'
+    \\for __fx_snapshot_name in $(\builtin compgen -A function); do
+    \\  case $__fx_snapshot_name in _*|__fx_snapshot_*) continue;; esac
+    \\  \builtin declare -f -- "$__fx_snapshot_name"
+    \\done
+    \\\builtin alias -p
+    \\for __fx_snapshot_name in extglob nullglob dotglob globstar nocaseglob failglob nocasematch globasciiranges; do
+    \\  \builtin shopt -p "$__fx_snapshot_name" 2>/dev/null
+    \\done
+    \\\builtin printf '\0FXSNAP:@NONCE@:END\0'
+    \\} 2>/dev/null
+;
+
+/// Builds the script a login shell runs once to capture its state as a
+/// NUL-delimited payload: exported environment, alias and function names, and
+/// a replay of functions, aliases, and selected options. Every section marker
+/// carries `nonce`, so output printed by the user's startup files cannot be
+/// mistaken for the payload. `nonce` must be ASCII hex.
+pub fn snapshotCaptureScript(
+    alloc: Allocator,
+    kind: ShellKind,
+    nonce: []const u8,
+) Allocator.Error![]u8 {
+    for (nonce) |byte| std.debug.assert(std.ascii.isHex(byte));
+    const template = switch (kind) {
+        .zsh => zsh_capture_script,
+        .bash => bash_capture_script,
+    };
+    return std.mem.replaceOwned(u8, alloc, template, "@NONCE@", nonce);
 }
 
 pub fn formatInvocationCommand(
@@ -221,7 +379,7 @@ pub fn buildBootstrap(
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(alloc);
 
-    try output.appendSlice(alloc, "set +x; ");
+    try output.appendSlice(alloc, "set +x; export AI_AGENT=fx; ");
     if (command_path) |path| {
         try output.appendSlice(alloc, "fx_terminal_command=$(< ");
         try appendShellWord(&output, alloc, path);
@@ -338,6 +496,32 @@ test "resolver makes clean startup explicit" {
     );
 }
 
+test "shell environments bind executable path and startup mode" {
+    const alloc = std.testing.allocator;
+    const clean = try environmentForShellSpec(
+        alloc,
+        null,
+        .{ .executable = .{ .path = "/bin/bash", .clean_start = true } },
+    );
+    defer switch (clean) {
+        .clean => |path| alloc.free(@constCast(path)),
+        else => {},
+    };
+    try std.testing.expectEqualStrings("/bin/bash", clean.clean);
+
+    const user = try environmentForShellSpec(
+        alloc,
+        null,
+        .{ .executable = .{ .path = "/bin/bash" } },
+    );
+    defer switch (user) {
+        .user => |path| alloc.free(@constCast(path)),
+        else => {},
+    };
+    try std.testing.expectEqualStrings("/bin/bash", user.user);
+    try std.testing.expect(!clean.eql(user));
+}
+
 test "resolver rejects missing relative and unsupported shells" {
     try std.testing.expectError(
         error.MissingLoginShell,
@@ -356,7 +540,7 @@ test "resolver rejects missing relative and unsupported shells" {
 test "login shell resolution falls back without accepting explicit unsupported shells" {
     const fallback = try resolve("/opt/homebrew/bin/fish", .user_login);
     try std.testing.expectEqualStrings(fallbackLoginShell(), fallback.path);
-    if (builtin.os.tag == .macos) {
+    if (builtin.target.os.tag == .macos) {
         try std.testing.expectEqualSlices(
             []const u8,
             &.{ "/bin/zsh", "-l", "-i" },
@@ -377,34 +561,44 @@ test "login shell resolution falls back without accepting explicit unsupported s
 }
 
 test "captured profiles use exact non-PTY argv" {
-    const bash_clean = try capturedInvocation(.{ .clean = "/bin/bash" }, "printf clean");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const bash_clean = try capturedInvocation(arena, .{ .clean = "/bin/bash" }, "printf clean");
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "/bin/bash", "--noprofile", "--norc", "-c", "printf clean" },
         bash_clean.argv(),
     );
-    const bash_user = try capturedInvocation(.{ .user = "/bin/bash" }, "printf user");
+    const bash_user = try capturedInvocation(arena, .{ .user = "/bin/bash" }, "printf user");
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "/bin/bash", "--login", "-O", "expand_aliases", "-c", "printf user" },
         bash_user.argv(),
     );
-    const zsh_clean = try capturedInvocation(.{ .clean = "/bin/zsh" }, "printf clean");
+    const zsh_clean = try capturedInvocation(arena, .{ .clean = "/bin/zsh" }, "printf clean");
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "/bin/zsh", "-f", "-c", "printf clean" },
         zsh_clean.argv(),
     );
-    const zsh_user = try capturedInvocation(.{ .user = "/bin/zsh" }, "printf user");
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "/bin/zsh", "-l", "-i", "-c", "printf user" },
-        zsh_user.argv(),
-    );
+    const zsh_user = try capturedInvocation(arena, .{ .user = "/bin/zsh" }, "printf user");
+    const expected_zsh_user = [_][]const u8{
+        "/bin/zsh",
+        "-l",
+        "-i",
+        "-c",
+        "\\builtin trap - TERM; printf user",
+    };
+    try std.testing.expectEqual(expected_zsh_user.len, zsh_user.argv().len);
+    for (&expected_zsh_user, zsh_user.argv()) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual);
+    }
 }
 
 test "captured invocation provider projection shell-quotes every argv word" {
-    const invocation = try capturedInvocation(.{ .clean = "/bin/zsh" }, "printf '%s' ok");
+    const invocation = try capturedInvocation(std.testing.allocator, .{ .clean = "/bin/zsh" }, "printf '%s' ok");
     const command = try formatInvocationCommand(std.testing.allocator, &invocation);
     defer std.testing.allocator.free(command);
     try std.testing.expectEqualStrings(
@@ -439,8 +633,8 @@ test "unsupported login shell profiles fall back for captured and persistent exe
     try std.testing.expect(user_environment.eql(.{ .user = fallback }));
     try std.testing.expect(clean_environment.eql(.{ .clean = fallback }));
 
-    const user_invocation = try capturedInvocation(user_environment, "printf user");
-    const clean_invocation = try capturedInvocation(clean_environment, "printf clean");
+    const user_invocation = try capturedInvocation(arena, user_environment, "printf user");
+    const clean_invocation = try capturedInvocation(arena, clean_environment, "printf clean");
     try std.testing.expectEqualStrings(fallback, user_invocation.path);
     try std.testing.expectEqualStrings(fallback, clean_invocation.path);
 
@@ -464,7 +658,7 @@ test "bootstrap quotes private paths and separates command completion" {
     );
     defer std.testing.allocator.free(commandless);
     try std.testing.expectEqualStrings(
-        "set +x; '/tmp/fx'\"'\"'bin' '--fx-internal-terminal-control' " ++
+        "set +x; export AI_AGENT=fx; '/tmp/fx'\"'\"'bin' '--fx-internal-terminal-control' " ++
             "'/tmp/control' 'nonce' 'shell-ready' || exit 125\n",
         commandless,
     );
@@ -513,7 +707,7 @@ fn checkBootstrapAllocationFailures(alloc: Allocator) !void {
 
 test "bootstrap construction cleans every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkBootstrapAllocationFailures,
         .{},
     );

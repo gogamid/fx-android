@@ -1,11 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -19,6 +22,7 @@ import {
   fakeGatewaySse,
   fakeGatewaySerializedToolCall,
   fakeGatewayToolCall,
+  fakeShellRun,
   startDynamicFakeGateway,
   startFakeGateway,
   terminalFixtureShell,
@@ -34,6 +38,12 @@ const MARKDOWN =
   "- first item\n- second item\n\n---\n\n" +
   "| Name | Value |\n| --- | --- |\n| one | two |\n\n" +
   "```zig\nconst answer: u8 = 42;\n```\n";
+const WIDE_TABLE =
+  "| # | Choice | Direct consequences |\n" +
+  "|---|---|---|\n" +
+  "| 1 | **Change:** on reopen, an unfinished turn gets `turn_interrupted{reason: crash}`; it's never cut | " +
+  "`recovery.json` and `recovery.asked` go away. The adapter handles a turn that ends in a tool call with no result |\n" +
+  "| 8 | **Keep:** forks start only at turn boundaries (or turn 0) | Mid-turn forks deferred |\n";
 
 const roots: string[] = [];
 const gateways: Array<{ stop(): void }> = [];
@@ -42,19 +52,8 @@ const sessions: TmuxSession[] = [];
 afterEach(async () => {
   for (const session of sessions.splice(0)) await session.kill();
   for (const gateway of gateways.splice(0)) gateway.stop();
-  await Promise.all(roots.map(waitForTerminalHostExit));
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
-
-async function waitForTerminalHostExit(root: string): Promise<void> {
-  const identityPath = join(root, "home", ".fx", "terminal-host", "host.json");
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline) {
-    if (!existsSync(identityPath)) return;
-    await Bun.sleep(25);
-  }
-  throw new Error(`terminal host did not exit for ${root}`);
-}
 
 function createRoot() {
   const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-presentation-"));
@@ -144,14 +143,14 @@ describe("fx ask presentation", () => {
         {
           type: "tool-call",
           toolCallId: "no-final-newline",
-          toolName: "terminal",
-          input: { action: "exec", command: "printf no-final-newline" },
+          toolName: "shell",
+          input: { request: { action: "run", profile: "clean", yield_time_ms: 30_000, command: "printf no-final-newline" } },
         },
         {
           type: "tool-call",
           toolCallId: "next-command",
-          toolName: "terminal",
-          input: { action: "exec", command: "printf 'next-output\\n'" },
+          toolName: "shell",
+          input: { request: { action: "run", profile: "clean", yield_time_ms: 30_000, command: "printf 'next-output\\n'" } },
         },
         {
           type: "finish",
@@ -172,14 +171,12 @@ describe("fx ask presentation", () => {
     );
 
     expect(result.code).toBe(0);
-    expect(result.stderr).toContain(
-      "no-final-newline\nRunning printf 'next-output\\n'\nnext-output\n",
-    );
-    expect(result.stderr).not.toContain("no-final-newlineRunning printf");
+    expect(result.stderr).toContain("Running printf no-final-newline\n");
+    expect(result.stderr).toContain("Running printf 'next-output\\n'\n");
     expect(JSON.parse(result.stdout).output).toBe("Commands complete.\n");
   }, TIMEOUT);
 
-  test("no-save advertises exec only and preserves terminal exec profiles", async () => {
+  test("no-save advertises process-local shell actions and preserves run profiles", async () => {
     const configuredShell = userInfo().shell;
     if (!configuredShell.endsWith("/bash") && !configuredShell.endsWith("/zsh")) return;
 
@@ -214,42 +211,39 @@ describe("fx ask presentation", () => {
       "if command -v fx_profile_function >/dev/null; then fx_profile_function; else printf no-function; fi";
     const nestedExecMarker = join(root.workspace, "nested-no-save-ran");
     const gateway = startFakeGateway([
-      fakeGatewayToolCall("terminal-omitted", "terminal", {
-        action: "exec",
-        command: profileCommand,
+      fakeGatewayToolCall("shell-omitted", "shell", {
+        request: { action: "run", command: profileCommand, yield_time_ms: 30_000 },
       }),
-      fakeGatewayToolCall("terminal-clean", "terminal", {
-        action: "exec",
-        command: profileCommand,
-        profile: "clean",
+      fakeGatewayToolCall("shell-clean", "shell", {
+        request: { action: "run", command: profileCommand, profile: "clean", yield_time_ms: 30_000 },
       }),
-      fakeGatewayToolCall("terminal-user", "terminal", {
-        action: "exec",
-        command: profileCommand,
-        profile: "user",
+      fakeGatewayToolCall("shell-user", "shell", {
+        request: { action: "run", command: profileCommand, profile: "user", yield_time_ms: 30_000 },
       }),
-      fakeGatewayToolCall("terminal-stale-start", "terminal", {
-        action: "start",
-        command: "printf should-not-start",
-        return_when: { kind: "exit" },
-        wait_ceiling_ms: 8_000,
-      }),
-      fakeGatewayToolCall("terminal-nested-exec", "terminal", {
+      fakeGatewayToolCall("shell-stale-tty", "shell", {
         request: {
-          action: "exec",
+          action: "run",
+          command: "printf should-not-start",
+          tty: true,
+        },
+      }),
+      fakeGatewayToolCall("shell-nested-run", "shell", {
+        request: {
+          action: "run",
+          profile: "clean",
+          yield_time_ms: 30_000,
           command: `printf nested > ${JSON.stringify(nestedExecMarker)}`,
         },
       }),
-      fakeGatewayToolCall("terminal-neighbor-exec", "terminal", {
-        action: "exec",
-        command: "printf neighbor-exec",
+      fakeGatewayToolCall("shell-neighbor-run", "shell", {
+        request: { action: "run", profile: "clean", yield_time_ms: 30_000, command: "printf neighbor-exec" },
       }),
-      fakeGatewayFinalText("Terminal no-save profiles verified.\n"),
+      fakeGatewayFinalText("Shell no-save profiles verified.\n"),
     ]);
     gateways.push(gateway);
 
     const result = await runFx(
-      ["ask", "--json", "--yolo", "--no-save", "Verify terminal exec profiles."],
+      ["ask", "--json", "--yolo", "--no-save", "Verify shell run profiles."],
       {
         cwd: root.workspace,
         env: gatewayEnv(root.home, gateway),
@@ -262,58 +256,35 @@ describe("fx ask presentation", () => {
       output: string;
       tool_calls: Array<{ name: string; status: string }>;
     };
-    expect(output.output).toBe("Terminal no-save profiles verified.\n");
+    expect(output.output).toBe("Shell no-save profiles verified.\n");
     expect(output.tool_calls.map(({ name, status }) => ({ name, status }))).toEqual([
-      { name: "terminal", status: "success" },
-      { name: "terminal", status: "success" },
-      { name: "terminal", status: "success" },
-      { name: "terminal", status: "error" },
-      { name: "terminal", status: "error" },
-      { name: "terminal", status: "success" },
+      { name: "shell", status: "success" },
+      { name: "shell", status: "success" },
+      { name: "shell", status: "success" },
+      { name: "shell", status: "error" },
+      { name: "shell", status: "success" },
+      { name: "shell", status: "success" },
     ]);
     expect(gateway.requests).toHaveLength(7);
 
     const firstRequest = JSON.parse(gateway.requests[0]!.body) as {
-      tools: Array<{
-        name?: string;
-        description?: string;
-        inputSchema?: {
-          properties?: Record<string, {
-            enum?: string[];
-            description?: string;
-          }>;
-          required?: string[];
-          additionalProperties?: boolean;
-        };
-      }>;
+      tools: Array<any>;
     };
-    const terminalTool = firstRequest.tools.find(({ name }) => name === "terminal");
-    expect(terminalTool?.description).toBe(
-      "Run one captured command and return its result.",
-    );
-    const terminalSchema = terminalTool?.inputSchema;
-    expect(terminalSchema?.properties?.action?.enum).toEqual(["exec"]);
-    expect(Object.keys(terminalSchema?.properties ?? {})).toEqual([
-      "action",
-      "command",
-      "cwd",
-      "profile",
+    const shellTool = firstRequest.tools.find(({ name }) => name === "shell");
+    const shellSchema = shellTool?.inputSchema;
+    expect(Object.keys(shellSchema?.properties ?? {})).toEqual(["request"]);
+    expect(shellSchema?.required).toEqual(["request"]);
+    expect(shellSchema?.additionalProperties).toBe(false);
+    const branches = shellSchema?.properties?.request?.oneOf ?? [];
+    expect(branches.map((branch: any) => branch.properties.action.enum[0])).toEqual([
+      "run",
+      "interact",
+      "stop",
     ]);
-    expect(terminalSchema?.required).toEqual(["action", "command", "cwd", "profile"]);
-    expect(terminalSchema?.additionalProperties).toBe(false);
-    expect(terminalSchema?.properties?.command?.description).toBe(
-      "Command to run. Set null when the selected action does not use this field.",
-    );
-    expect(terminalSchema?.properties?.cwd?.description).toBe(
-      "Working directory; defaults to the workspace. Set null when the selected action does not use this field.",
-    );
-    expect(terminalSchema?.properties?.profile?.description).toBe(
-      "Profile for exec; omission defaults to user, while clean skips user initialization files. User execution supports the configured Bash or zsh login shell. Bash login execution reads login initialization files; .bashrc is available only when sourced by the login profile. Set null when the selected action does not use this field.",
-    );
-    const serializedTerminalTool = JSON.stringify(terminalTool);
-    expect(serializedTerminalTool).not.toContain("Use start");
-    expect(serializedTerminalTool).not.toContain("Other actions");
-    expect(serializedTerminalTool).not.toContain("durable");
+    const serializedShellTool = JSON.stringify(shellTool);
+    expect(serializedShellTool).not.toContain('"tty"');
+    expect(serializedShellTool).not.toContain('"write"');
+    expect(serializedShellTool).not.toContain('"terminal"');
 
     for (const requestIndex of [1, 3]) {
       expect(gateway.requests[requestIndex]!.body).toContain("mode=login:rc:path-user:");
@@ -322,75 +293,22 @@ describe("fx ask presentation", () => {
     expect(gateway.requests[2]!.body).toContain("mode=unset:unset:path-clean:");
     expect(gateway.requests[2]!.body).toContain("no-alias:no-function");
     expect(gateway.requests[4]!.body).toContain("tool_execution_failed");
-    expect(gateway.requests[4]!.body).toContain(
-      "Durable terminal actions require a saved fx session.",
-    );
-    expect(gateway.requests[4]!.body).toContain(
-      "Use terminal.exec, or rerun without --no-save.",
-    );
+    expect(gateway.requests[4]!.body).toContain("tool_execution_failed");
     expect(gateway.requests[4]!.body).not.toContain("authority_denied");
     expect(gateway.requests[4]!.body).not.toContain("tool_permission_denied");
-    expect(gateway.requests[5]!.body).toContain(
-      "terminal arguments must match the advertised action schema",
-    );
-    expect(gateway.requests[5]!.body).not.toContain("tool_permission_denied");
-    expect(gateway.requests[5]!.body).toContain('"request"');
-    expect(existsSync(nestedExecMarker)).toBe(false);
+    expect(gateway.requests[5]!.body).toContain("nested");
+    expect(existsSync(nestedExecMarker)).toBe(true);
     expect(gateway.requests[6]!.body).toContain("neighbor-exec");
+    // The refused tty run never reached the terminal store.
     expect(
-      existsSync(join(root.home, ".fx", "terminal-host", "host.json")),
-    ).toBe(false);
+      existsSync(join(root.home, ".fx"))
+        ? Array.from(new Bun.Glob("**/terminal/state/record-*.json").scanSync({
+          cwd: join(root.home, ".fx"),
+          dot: true,
+        }))
+        : [],
+    ).toEqual([]);
   }, TIMEOUT);
-
-  test.skipIf(!tmuxAvailable())(
-    "fx ask executes the shared public terminal tool through the tmux backend",
-    async () => {
-      const root = createShortRoot();
-      const toolCallId = "ask_terminal_tmux_1";
-      const gateway = startFakeGateway([
-        fakeGatewayToolCall(toolCallId, "terminal", {
-          action: "start",
-          cwd: root.workspace,
-          command: "printf ASK_PUBLIC_TERMINAL_TMUX",
-          shell: {
-            kind: "executable",
-            path: TERMINAL_FIXTURE_SHELL,
-            clean_start: true,
-          },
-          backend: "tmux",
-          return_when: { kind: "exit" },
-          wait_ceiling_ms: 8_000,
-          dimensions: { rows: 24, columns: 80 },
-        }),
-        fakeGatewayFinalText("Ask public terminal complete.\n"),
-      ]);
-      gateways.push(gateway);
-
-      const result = await runFx(
-        ["ask", "--yolo", "Run the tmux public terminal fixture."],
-        {
-          cwd: root.workspace,
-          env: {
-            ...gatewayEnv(root.home, gateway),
-            FX_TERMINAL_HOST_IDLE_MS: "200",
-          },
-          timeoutMs: TIMEOUT,
-        },
-      );
-
-      expect(result.code).toBe(0);
-      expect(result.stdout).toBe("Ask public terminal complete.\n");
-      expect(result.stderr).toContain("Starting printf ASK_PUBLIC_TERMINAL_TMUX");
-      expect(result.stderr).not.toContain("Using terminal");
-      expect(result.stderr).not.toContain("Preparing command");
-      expect(result.stderr).not.toContain("failed");
-      expect(gateway.requests).toHaveLength(2);
-      expect(gateway.requests[1]!.body).toContain(toolCallId);
-      expect(gateway.requests[1]!.body).toContain('\\"backend\\":\\"tmux\\"');
-      expect(gateway.requests[1]!.body).toContain('\\"exited\\":0');
-    },
-    TIMEOUT,
-  );
 
   test("redirected and JSON stdout preserve raw assistant Markdown", async () => {
     const root = createRoot();
@@ -424,6 +342,124 @@ describe("fx ask presentation", () => {
     expect(json.stderr).toBe("");
   }, TIMEOUT);
 
+  test("JSON separates accumulated assistant Markdown from the completed final response", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "fixture.txt"), "fixture contents\n");
+    const intermediate = "I will inspect the fixture first.\n";
+    const final = "The fixture inspection is complete.";
+    const gateway = startFakeGateway([
+      fakeGatewaySerializedToolCall(
+        "read_fixture_for_final_output",
+        "read_file",
+        JSON.stringify({ path: "fixture.txt" }),
+        intermediate,
+      ),
+      fakeGatewayFinalText(final),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Inspect fixture.txt."],
+      {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    const output = JSON.parse(result.stdout) as {
+      output: string;
+      final_output: string;
+      tool_calls: Array<{ name: string; status: string }>;
+    };
+    expect(output.output).toContain(intermediate.trim());
+    expect(output.output).toContain(final.trim());
+    expect(output.output.indexOf(intermediate.trim())).toBeLessThan(
+      output.output.indexOf(final.trim()),
+    );
+    expect(output.final_output).toBe(final);
+    expect(output.final_output).not.toContain(intermediate.trim());
+    expect(output.tool_calls).toEqual([
+      { name: "read_file", status: "success" },
+    ]);
+    expect(gateway.requests).toHaveLength(2);
+    expect(result.stderr).toContain("Reading fixture.txt");
+  }, TIMEOUT);
+
+  test("tool recovery keeps progress updates ordered before the final response", async () => {
+    const root = createRoot();
+    writeFileSync(join(root.workspace, "fallback.txt"), "fallback contents\n");
+    const initial = "I will inspect the requested file first.";
+    const recovery = "The requested file was missing, so I will inspect fallback.txt next.";
+    const final = "The fallback inspection is complete.";
+    const gateway = startFakeGateway([
+      fakeGatewaySerializedToolCall(
+        "read_missing_for_progress",
+        "read_file",
+        JSON.stringify({ path: "missing.txt" }),
+        initial,
+      ),
+      fakeGatewaySerializedToolCall(
+        "read_fallback_for_progress",
+        "read_file",
+        JSON.stringify({ path: "fallback.txt" }),
+        recovery,
+      ),
+      fakeGatewayFinalText(final),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Inspect missing.txt and recover with fallback.txt."],
+      {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(gateway.requests).toHaveLength(3);
+    const firstPrompt = (JSON.parse(gateway.requests[0]!.body) as GatewayRequestBody)
+      .prompt
+      .filter((message) => message.role === "system")
+      .map((message) => typeof message.content === "string" ? message.content : "")
+      .join("\n");
+    expect(firstPrompt).toContain(
+      "Before the first tool call in a tool-driven task, always send one brief user-visible update",
+    );
+    expect(firstPrompt).toContain("Never start the first tool silently.");
+    expect(firstPrompt).toContain(
+      "If another tool call will follow, always first tell the user what failed",
+    );
+    expect(firstPrompt).toContain("Do not narrate each routine tool call.");
+
+    const output = JSON.parse(result.stdout) as {
+      output: string;
+      final_output: string;
+      tool_calls: Array<{ name: string; status: string }>;
+    };
+    expect(output.output).toContain(initial);
+    expect(output.output).toContain(recovery);
+    expect(output.output).toContain(final);
+    expect(output.output.indexOf(initial)).toBeLessThan(
+      output.output.indexOf(recovery),
+    );
+    expect(output.output.indexOf(recovery)).toBeLessThan(
+      output.output.indexOf(final),
+    );
+    expect(output.final_output).toBe(final);
+    expect(output.tool_calls).toEqual([
+      { name: "read_file", status: "error" },
+      { name: "read_file", status: "success" },
+    ]);
+    expect(gateway.requests[1]!.body).toContain("Path not found: missing.txt");
+    expect(gateway.requests[2]!.body).toContain(recovery);
+    expect(result.stderr).toContain("Reading missing.txt");
+    expect(result.stderr).toContain("Reading fallback.txt");
+  }, TIMEOUT);
+
   test.skipIf(!tmuxAvailable())(
     "TTY stdout uses the Minimal transcript and compact tool group",
     async () => {
@@ -449,6 +485,7 @@ describe("fx ask presentation", () => {
       gateways.push(gateway);
 
       const session = await TmuxSession.create({
+        isolated: true,
         cmd: terminalCommand([
           "ask",
           "--auto",
@@ -480,6 +517,8 @@ describe("fx ask presentation", () => {
       expect(pane).toContain("bold and docs");
       expect(pane).toContain("first item");
       expect(pane).toContain("const answer: u8 = 42;");
+      expect(pane).toContain("─ zig ─");
+      expect(pane).not.toContain("│ const answer: u8 = 42;");
       expect(pane).not.toContain("# Ask presentation");
       expect(pane).not.toContain("**bold**");
       expect(escaped).toContain("\x1b[");
@@ -488,52 +527,53 @@ describe("fx ask presentation", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "memory list is presented as a read-only tool call",
+    "inline code URL keeps its full target across wrapped transcript rows",
     async () => {
       const root = createRoot();
+      const url = "http://localhost:3210/bench?run=https://github.com/vercel/e/actions/runs/36247033515";
+      const gateway = startFakeGateway([fakeGatewayFinalText(`Open \`${url}.\`\n`)]);
+      gateways.push(gateway);
       const stderrPath = join(root.root, "stderr.log");
       writeFileSync(stderrPath, "");
-      const gateway = startFakeGateway([
-        fakeGatewayToolCall("memory_list", "memory", { action: "list" }),
-        fakeGatewayFinalText("Memory list complete.\n"),
-      ]);
-      gateways.push(gateway);
 
       const session = await TmuxSession.create({
-        cmd: terminalCommand([
-          "ask",
-          "--auto",
-          "--no-save",
-          "List saved memories.",
-        ]),
+        isolated: true,
+        cmd: FX_BIN,
         cwd: root.workspace,
         env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
-        width: 120,
-        height: 40,
-        remainOnExit: true,
+        width: 82,
+        height: 24,
         stderrPath,
       });
       sessions.push(session);
 
-      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      await session.sendText("Show the URL.");
+      await session.waitForText("3515.", TIMEOUT);
       const pane = await session.captureFullScrollback();
-      expect(pane).toContain("● 1 tool call · 1 read");
-      expect(pane).toContain("Listing memories");
-      expect(pane).not.toContain("1 write");
-      expect(pane).not.toContain("Remembered list");
+      const rows = pane.split("\n").filter((row) => row.includes("localhost:") || row.includes("3515."));
+      expect(rows).toHaveLength(2);
+      const escaped = await session.captureFullScrollbackEscapes();
+      const target = `\x1b]8;id=fx-1;${url}\x1b\\`;
+      const linkedRows = escaped.split("\n").filter((row) => row.includes(target));
+      expect(linkedRows).toHaveLength(2);
+      expect(linkedRows[0]).toContain("localhost:");
+      expect(linkedRows[1]).toContain("3515\x1b]8;;\x1b\\.");
+      expect(escaped).not.toContain(`\x1b]8;;${url}.\x1b\\`);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(gateway.requestCount()).toBe(1);
     },
     TIMEOUT,
   );
 
   test.skipIf(!tmuxAvailable())(
-    "--no-color keeps the TTY layout without Fx styles or hyperlinks",
+    "--no-color keeps the TTY layout without fx styles or hyperlinks",
     async () => {
       const root = createRoot();
       const gateway = startFakeGateway([fakeGatewayFinalText(MARKDOWN)]);
       gateways.push(gateway);
 
       const session = await TmuxSession.create({
+        isolated: true,
         cmd: terminalCommand([
           "ask",
           "--no-color",
@@ -571,6 +611,7 @@ describe("fx ask presentation", () => {
       writeFileSync(stderrPath, "");
 
       const session = await TmuxSession.create({
+        isolated: true,
         cmd: `${terminalCommand([
           "ask",
           "--no-save",
@@ -593,6 +634,45 @@ describe("fx ask presentation", () => {
       const escaped = await session.captureFullScrollbackEscapes();
       expect(escaped).toContain("\x1b[38;5;238mconst\x1b[39m");
       expect(escaped).not.toContain("\x1b[38;5;252mconst\x1b[39m");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TTY tables wider than the pane wrap cells inside the grid",
+    async () => {
+      const root = createRoot();
+      const gateway = startFakeGateway([fakeGatewayFinalText(WIDE_TABLE)]);
+      gateways.push(gateway);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["ask", "--no-save", "Render the wide table fixture."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 72,
+        height: 40,
+        remainOnExit: true,
+        stderrPath,
+      });
+      sessions.push(session);
+
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      const grid = scrollback
+        .split("\n")
+        .map((line) => line.trimEnd())
+        .filter((line) => /^\s*[┌│├└]/.test(line));
+      expect(grid[0]).toMatch(/^\s*┌───┬─+┬─+┐$/);
+      expect(grid.at(-1)).toMatch(/^\s*└───┴─+┴─+┘$/);
+      expect(new Set(grid.map((line) => line.length)).size).toBe(1);
+      expect(grid.some((line) => /^\s*│ 1 │ Change:/.test(line))).toBe(true);
+      expect(grid.some((line) => /^\s*│   │ \S/.test(line))).toBe(true);
+      expect(scrollback).not.toContain("Choice: ");
+      expect(scrollback).not.toContain("Direct consequences: ");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
@@ -628,6 +708,7 @@ describe("fx ask presentation", () => {
       writeFileSync(stderrPath, "");
 
       const session = await TmuxSession.create({
+        isolated: true,
         cmd: terminalCommand([
           "ask",
           "--no-save",
@@ -709,6 +790,7 @@ describe("fx ask presentation", () => {
       writeFileSync(stderrPath, "");
 
       const session = await TmuxSession.create({
+        isolated: true,
         cmd: terminalCommand([
           "ask",
           "--no-save",
@@ -790,6 +872,7 @@ describe("fx ask presentation", () => {
       writeFileSync(stderrPath, "");
 
       const session = await TmuxSession.create({
+        isolated: true,
         cmd: terminalCommand([
           "ask",
           "--no-save",
@@ -830,9 +913,8 @@ describe("fx ask presentation", () => {
       symlinkSync(instructions, join(root.workspace, "AGENTS.md"));
       const gateway = startFakeGateway(
         [
-          fakeGatewayToolCall("write_fixture", "terminal", {
-            action: "exec",
-            command: "printf notice-test > ask-notice.txt",
+          fakeShellRun("write_fixture", "printf notice-test > ask-notice.txt", {
+            timeout_ms: 600_000,
           }),
           fakeGatewayFinalText("Notice filtering complete.\n"),
         ],
@@ -841,6 +923,7 @@ describe("fx ask presentation", () => {
       gateways.push(gateway);
 
       const session = await TmuxSession.create({
+        isolated: true,
         cmd: terminalCommand([
           "ask",
           "--auto",
@@ -862,7 +945,189 @@ describe("fx ask presentation", () => {
       expect(scrollback).toContain("1 tool call · 1 command");
       expect(scrollback).not.toContain("project instructions");
       expect(scrollback).not.toContain("Auto agent approved this request");
-      expect(scrollback).not.toContain("● System:");
+      expect(scrollback).not.toMatch(/[*✓!✗⊘i] system:/);
+    },
+    TIMEOUT,
+  );
+});
+
+// Both login shells read these files, so the tests hold for zsh and bash.
+function writeStartupFiles(home: string, body: string): void {
+  writeFileSync(join(home, ".zshrc"), body);
+  writeFileSync(join(home, ".bash_profile"), body);
+}
+
+function startupLoads(home: string): number {
+  const log = join(home, "rc.log");
+  return existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).length : 0;
+}
+
+function userShellRun(id: string, command: string) {
+  return fakeGatewayToolCall(id, "shell", {
+    request: { action: "run", command, yield_time_ms: 30_000 },
+  });
+}
+
+function filesContaining(dir: string, needle: string): string[] {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).flatMap((name) => {
+    const path = join(dir, name);
+    if (statSync(path).isDirectory()) return filesContaining(path, needle);
+    return readFileSync(path).includes(needle) ? [path] : [];
+  });
+}
+
+function occurrences(text: string, needle: string): number {
+  return text.split(needle).length - 1;
+}
+
+describe("fx ask shell startup files", () => {
+  test("user-profile commands load startup files once and reload after an edit", async () => {
+    const root = createRoot();
+    writeStartupFiles(
+      root.home,
+      "printf 'loaded\\n' >> \"$HOME/rc.log\"\n" +
+        "export PATH=\"$HOME/fx-startup-marker:$PATH\"\n",
+    );
+    const edit = "for f in ~/.zshrc ~/.bash_profile; do " +
+      "printf '%s\\n' \"alias fxlate='printf FX_RELOADED_ALIAS'\" >> \"$f\"; done";
+    const gateway = startFakeGateway([
+      userShellRun("path-0", "echo \"PATH=$PATH\""),
+      userShellRun("path-1", "echo \"PATH=$PATH\""),
+      userShellRun("path-2", "echo \"PATH=$PATH\""),
+      userShellRun("edit", edit),
+      userShellRun("reloaded", "fxlate"),
+      fakeGatewayFinalText("Startup files checked.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", "Check the startup files."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    const marker = `${root.home}/fx-startup-marker:`;
+    for (const index of [1, 2, 3]) {
+      expect(gateway.requests[index]!.body).toContain(`PATH=${marker}`);
+    }
+    expect(gateway.requests[5]!.body).toContain("FX_RELOADED_ALIAS");
+    // One capture, and one more after the edit: never once per command.
+    expect(startupLoads(root.home)).toBe(2);
+    expect(result.stderr).not.toContain("shell snapshot unavailable");
+  }, TIMEOUT);
+
+  test("startup files the snapshot cannot capture fall back with one notice", async () => {
+    const root = createRoot();
+    // A 9 MB alias exceeds the 8 MiB capture limit, while full startup still
+    // works for every command.
+    writeStartupFiles(
+      root.home,
+      "printf 'loaded\\n' >> \"$HOME/rc.log\"\n" +
+        "alias fxbig=\"$(head -c 9000000 /dev/zero | tr '\\0' x)\"\n" +
+        "alias fxsmall='printf FX_FULL_STARTUP_ALIAS'\n",
+    );
+    const gateway = startFakeGateway([
+      userShellRun("first", "fxsmall"),
+      userShellRun("second", "fxsmall"),
+      fakeGatewayFinalText("Fallback checked.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", "Check the fallback."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    const notice = "shell snapshot unavailable (the captured state exceeded 8 MiB)";
+    expect(occurrences(result.stderr, `fx ask: warning: ${notice}`)).toBe(1);
+    expect(occurrences(gateway.requests[1]!.body, notice)).toBe(1);
+    // The later request repeats the history, so one notice in total.
+    expect(occurrences(gateway.requests[2]!.body, notice)).toBe(1);
+    expect(occurrences(gateway.requests[2]!.body, "FX_FULL_STARTUP_ALIAS")).toBe(2);
+    // The failed capture plus one full startup per command.
+    expect(startupLoads(root.home)).toBe(3);
+  }, TIMEOUT);
+
+  test("a fallback notice still appears when the snapshot recovers in the same run", async () => {
+    const root = createRoot();
+    // The first startup run, the capture, kills its own shell; later runs work.
+    writeStartupFiles(
+      root.home,
+      "if [ ! -e \"$HOME/fault-fired\" ]; then : > \"$HOME/fault-fired\"; kill -9 $$; fi\n" +
+        "alias fxa='printf FX_RECOVERY_ALIAS'\n",
+    );
+    const gateway = startFakeGateway([
+      userShellRun("fallback", "fxa"),
+      userShellRun("edit", "printf '# edited\\n' >> ~/.zshrc; printf '# edited\\n' >> ~/.bash_profile"),
+      userShellRun("recovered", "fxa"),
+      fakeGatewayFinalText("Recovery checked.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", "Check recovery."],
+      { cwd: root.workspace, env: gatewayEnv(root.home, gateway), timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(existsSync(join(root.home, "fault-fired"))).toBe(true);
+    const notice = "fx ask: warning: shell snapshot unavailable (the login shell exited before reporting its state)";
+    expect(occurrences(result.stderr, notice)).toBe(1);
+    expect(gateway.requests[3]!.body).toContain("FX_RECOVERY_ALIAS");
+  }, TIMEOUT);
+
+  test.skipIf(!tmuxAvailable())(
+    "exported startup-file secrets stay out of traces, sessions, and trace reports",
+    async () => {
+      const root = createRoot();
+      const secret = `FX_SENTINEL_${crypto.randomUUID()}`;
+      writeStartupFiles(root.home, `export FX_E2E_SECRET=${secret}\n`);
+      const clipboardBin = join(root.root, "clipboard-bin");
+      mkdirSync(clipboardBin);
+      writeFileSync(join(clipboardBin, "osascript"), "#!/bin/sh\nexit 1\n");
+      chmodSync(join(clipboardBin, "osascript"), 0o755);
+      const tracePath = join(root.root, "fx-trace.log");
+      const gateway = startFakeGateway([
+        userShellRun("secret", "test -n \"$FX_E2E_SECRET\" && printf FX_SECRET_VISIBLE"),
+        fakeGatewayFinalText("SECRET_CHECK_DONE"),
+      ]);
+      gateways.push(gateway);
+      const session = await TmuxSession.create({
+        cwd: root.workspace,
+        width: 110,
+        height: 34,
+        stderrPath: join(root.root, "stderr.log"),
+        env: {
+          ...gatewayEnv(root.home, gateway),
+          FX_PERMISSION_MODE: "full-access",
+          FX_SOUND: "0",
+          FX_AUTO_UPGRADE: "0",
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "core,tool,agent,session",
+          PATH: `${clipboardBin}:${process.env.PATH}`,
+          TMPDIR: root.root,
+        },
+      });
+      try {
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("Check the secret.");
+        await session.waitForText("SECRET_CHECK_DONE", TIMEOUT);
+        await session.sendText("/trace");
+        await session.waitForText("Trace saved at", TIMEOUT);
+      } finally {
+        await session.kill();
+      }
+
+      expect(gateway.requests[1]!.body).toContain("FX_SECRET_VISIBLE");
+      const report = readdirSync(root.root).find((name) => name.startsWith("fx-trace-") && name.endsWith(".md"));
+      expect(report).toBeDefined();
+      expect(readFileSync(join(root.root, report!), "utf8")).not.toContain(secret);
+      expect(readFileSync(tracePath, "utf8")).toContain("shell snapshot ready");
+      expect(readFileSync(tracePath, "utf8")).not.toContain(secret);
+      expect(filesContaining(join(root.home, ".fx"), secret)).toEqual([]);
+      for (const request of gateway.requests) expect(request.body).not.toContain(secret);
     },
     TIMEOUT,
   );

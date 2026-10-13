@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const credentials = @import("credentials.zig");
 const chatgpt_session = @import("chatgpt_session.zig");
@@ -88,6 +89,31 @@ pub const TeamSelection = struct {
         return session.team_id orelse session.team_slug;
     }
 
+    /// Returns an owned candidate for authenticated Gateway validation without
+    /// changing the durable session. The caller must deinitialize the result.
+    pub fn validationCredential(
+        self: *const TeamSelection,
+        alloc: Allocator,
+        selected_index: usize,
+    ) !credentials.Credential {
+        const session = self.session orelse return LoginError.NoSession;
+        if (selected_index >= self.teams.items.len) return LoginError.InvalidTeamSelection;
+        const selected = self.teams.items[selected_index];
+
+        const token = try alloc.dupe(u8, session.access_token);
+        errdefer secret.zeroAndFree(alloc, token);
+        const team_id = try alloc.dupe(u8, selected.id);
+        errdefer alloc.free(team_id);
+        const team_slug = try alloc.dupe(u8, selected.slug);
+        errdefer alloc.free(team_slug);
+        return .{
+            .token = token,
+            .source = .fx_login,
+            .team_id = team_id,
+            .team_slug = team_slug,
+        };
+    }
+
     pub fn select(self: *const TeamSelection, alloc: Allocator, selected_index: usize) !SelectedTeam {
         const session = self.session orelse return LoginError.NoSession;
         if (selected_index >= self.teams.items.len) return LoginError.InvalidTeamSelection;
@@ -119,6 +145,42 @@ pub const TeamSelection = struct {
     }
 };
 
+pub const TeamValidationResult = enum {
+    accepted,
+    rejected,
+};
+
+pub const TeamValidator = struct {
+    context: ?*anyopaque = null,
+    validate_fn: *const fn (
+        ?*anyopaque,
+        credentials.Credential,
+    ) std.mem.Allocator.Error!TeamValidationResult,
+
+    pub fn validate(
+        self: TeamValidator,
+        credential: credentials.Credential,
+    ) std.mem.Allocator.Error!TeamValidationResult {
+        return self.validate_fn(self.context, credential);
+    }
+};
+
+/// Validates the proposed token/team authority before the existing selection
+/// mutation acquires its lock and commits durable state.
+pub fn validateAndSelectTeam(
+    alloc: Allocator,
+    selection: *const TeamSelection,
+    selected_index: usize,
+    validator: TeamValidator,
+) !SelectedTeam {
+    var candidate = try selection.validationCredential(alloc, selected_index);
+    defer candidate.deinit(alloc);
+    if (try validator.validate(candidate) != .accepted) {
+        return error.TeamValidationFailed;
+    }
+    return selection.select(alloc, selected_index);
+}
+
 pub const SignInState = enum {
     idle,
     polling,
@@ -132,7 +194,10 @@ pub const SignInSnapshot = struct {
     verification_uri: []const u8 = "",
     verification_uri_complete: ?[]const u8 = null,
     user_code: []const u8 = "",
+    accepts_manual_code: bool = false,
 };
+
+pub const max_manual_code_bytes: usize = 4096;
 
 pub const SignInCompletion = union(enum) {
     vercel: TeamSelection,
@@ -175,6 +240,57 @@ pub const PreparedLogin = struct {
     }
 };
 
+pub const BrowserPreparedOptions = struct {
+    issuer: []const u8,
+    authorization_endpoint_suffix: []const u8,
+    /// Ownership transfers to the returned login on success.
+    token_endpoint: []u8,
+    /// Ownership transfers to the returned login on success.
+    verification_uri: []u8,
+    client_id: []const u8,
+    expires_in: i64,
+};
+
+/// Builds the device-shaped storage used by browser OAuth flows. On failure,
+/// caller-owned option fields remain owned by the caller.
+pub fn prepareBrowserLogin(
+    alloc: Allocator,
+    options: BrowserPreparedOptions,
+) !PreparedLogin {
+    const issuer = try alloc.dupe(u8, options.issuer);
+    errdefer alloc.free(issuer);
+    const authorization_endpoint = try alloc.print(
+        "{s}{s}",
+        .{
+            std.mem.trimEnd(u8, options.issuer, "/"),
+            options.authorization_endpoint_suffix,
+        },
+    );
+    errdefer alloc.free(authorization_endpoint);
+    const device_code = try alloc.dupe(u8, "");
+    errdefer secret.zeroAndFree(alloc, device_code);
+    const user_code = try alloc.dupe(u8, "");
+    errdefer alloc.free(user_code);
+    const client_id = try alloc.dupe(u8, options.client_id);
+    errdefer alloc.free(client_id);
+
+    return .{
+        .metadata = .{
+            .issuer = issuer,
+            .device_authorization_endpoint = authorization_endpoint,
+            .token_endpoint = options.token_endpoint,
+        },
+        .device = .{
+            .device_code = device_code,
+            .user_code = user_code,
+            .verification_uri = options.verification_uri,
+            .expires_in = options.expires_in,
+            .interval = 1,
+        },
+        .client_id = client_id,
+    };
+}
+
 pub const CompleteSignInFn = *const fn (
     ?*anyopaque,
     Allocator,
@@ -183,7 +299,9 @@ pub const CompleteSignInFn = *const fn (
     *oauth.TokenSet,
 ) anyerror!SignInCompletion;
 pub const SaveSignInFn = *const fn (?*anyopaque, Allocator, SignInCompletion) anyerror!void;
+pub const FinishSignInFn = *const fn (?*anyopaque, Allocator, bool) void;
 pub const DeinitSignInContextFn = *const fn (?*anyopaque, Allocator) void;
+pub const SubmitManualCodeFn = *const fn (?*anyopaque, Allocator, []const u8) anyerror!void;
 
 pub const SignInRuntimeDeps = struct {
     ctx: ?*anyopaque = null,
@@ -192,6 +310,8 @@ pub const SignInRuntimeDeps = struct {
     poll: LoginPollDeps = .{},
     complete: CompleteSignInFn = completeSignIn,
     save: SaveSignInFn = saveSignIn,
+    finish: ?FinishSignInFn = null,
+    submit_manual_code: ?SubmitManualCodeFn = null,
 };
 
 pub const SignInRuntime = struct {
@@ -314,7 +434,17 @@ pub const SignInRuntime = struct {
             .verification_uri = flow.device.verification_uri,
             .verification_uri_complete = flow.device.verification_uri_complete,
             .user_code = flow.device.user_code,
+            .accepts_manual_code = self.deps.submit_manual_code != null,
         };
+    }
+
+    pub fn submitManualCode(self: *Self, alloc: Allocator, code: []const u8) !bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.state != .polling) return false;
+        const submit = self.deps.submit_manual_code orelse return false;
+        try submit(self.deps.ctx, alloc, code);
+        return true;
     }
 
     pub fn browserUrlAlloc(self: *Self, alloc: Allocator) !?[]u8 {
@@ -362,6 +492,7 @@ pub const SignInRuntime = struct {
     }
 
     fn workerMain(self: *Self, alloc: Allocator) void {
+        defer self.finishAttempt(alloc);
         const flow = if (self.flow) |*prepared| prepared else return;
         var prompt = BrowserOpenPrompt{ .url = flow.device.verification_uri };
         var token = pollForTokenWithDeps(
@@ -388,6 +519,7 @@ pub const SignInRuntime = struct {
 
     fn pulseCooperative(self: *Self, alloc: Allocator) void {
         if (self.state != .polling) return;
+        defer self.finishAttempt(alloc);
         const flow = if (self.flow) |*prepared| prepared else return;
         const poll_state = if (self.poll_state) |*state| state else {
             self.publishFailure(error.LoginPollStateMissing);
@@ -444,7 +576,7 @@ pub const SignInRuntime = struct {
         }
         self.deps.save(self.deps.ctx, alloc, completion) catch |err| {
             debug_trace.logf("auth", "sign-in session save failed err={s}", .{@errorName(err)});
-            self.failure = err;
+            self.failure = signInPersistenceError(err);
             self.state = .failed;
             return;
         };
@@ -472,6 +604,7 @@ pub const SignInRuntime = struct {
     }
 
     fn clearFlow(self: *Self, alloc: Allocator) void {
+        self.finishAttempt(alloc);
         self.mutex.lockUncancelable(io_mod.getIo());
         var flow = self.flow;
         const deps = self.deps;
@@ -482,12 +615,29 @@ pub const SignInRuntime = struct {
         if (flow) |*prepared| prepared.deinit(alloc);
         if (deps.deinit_ctx) |deinit_ctx| deinit_ctx(deps.ctx, alloc);
     }
+
+    // Notify once after persistence, outside the state lock. A disconnected
+    // browser cannot turn a committed credential into a failed sign-in.
+    fn finishAttempt(self: *Self, alloc: Allocator) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        if (self.state == .polling) {
+            self.mutex.unlock(io_mod.getIo());
+            return;
+        }
+        const finish = self.deps.finish;
+        self.deps.finish = null;
+        const ctx = self.deps.ctx;
+        const saved = self.state == .succeeded;
+        self.mutex.unlock(io_mod.getIo());
+        if (finish) |notify| notify(ctx, alloc, saved);
+    }
 };
 
 fn prepareLogin(
     alloc: Allocator,
     transport: oauth_transport.Provider,
 ) !PreparedLogin {
+    try credentials.requireSignInStorage(.fx_login);
     var client_id = oauth_session.configuredClientId() orelse return LoginError.ClientIdMissing;
     const issuer_url = try oauth_session.configuredIssuerUrl();
 
@@ -535,6 +685,10 @@ fn saveSignIn(_: ?*anyopaque, alloc: Allocator, completion: SignInCompletion) !v
     try oauth_session.saveNewSession(alloc, session);
 }
 
+fn signInPersistenceError(err: anyerror) (Allocator.Error || error{CredentialPersistenceFailed}) {
+    return if (err == error.OutOfMemory) error.OutOfMemory else error.CredentialPersistenceFailed;
+}
+
 pub fn runLogin(
     alloc: Allocator,
     transport: oauth_transport.Provider,
@@ -580,9 +734,10 @@ pub fn runLogin(
     );
     defer session.deinit(alloc);
 
-    try oauth_session.saveNewSession(alloc, session);
-    try writeStdout("Signed in to Vercel.\n");
-    try writeStdout("AI Gateway access may still require billing or API setup for the selected account.\n");
+    oauth_session.saveNewSession(alloc, session) catch |err| {
+        debug_trace.logf("auth", "sign-in session save failed err={s}", .{@errorName(err)});
+        return signInPersistenceError(err);
+    };
 }
 
 fn take_login_session(
@@ -632,6 +787,7 @@ fn take_login_session(
 pub fn runTeams(
     alloc: Allocator,
     transport: oauth_transport.Provider,
+    validator: TeamValidator,
 ) !void {
     var selection = try loadTeamSelection(alloc, transport);
     defer selection.deinit(alloc);
@@ -639,7 +795,7 @@ pub fn runTeams(
     const selected_index = (try selectTeam(alloc, selection.teams.items, selection.currentTeam())) orelse
         return LoginError.NoTeams;
     const selected = selection.teams.items[selected_index];
-    var changed_team = try selection.select(alloc, selected_index);
+    var changed_team = try validateAndSelectTeam(alloc, &selection, selected_index, validator);
     defer changed_team.deinit(alloc);
     try writeStdoutFmt("Selected Vercel team: {s} ({s}).\n", .{ selected.name, selected.slug });
 }
@@ -690,9 +846,12 @@ pub fn logout(
             return LogoutError.SessionDeleteFailed;
         }) orelse return .{};
         defer mutation.deinit();
-        session = mutation.load(alloc) catch load: {
-            session_load_failed = true;
-            break :load null;
+        session = mutation.load(alloc) catch |err| switch (err) {
+            error.InvalidAuthSession => null,
+            else => load: {
+                session_load_failed = true;
+                break :load null;
+            },
         };
         break :blk mutation.delete(alloc) catch oauth_session.DeleteResult{
             .local_cleanup_failed = true,
@@ -938,7 +1097,7 @@ const BrowserOpenPrompt = struct {
 
     fn writeWaitingMessage(self: BrowserOpenPrompt) !void {
         if (self.enabled) {
-            try writeStdout("Waiting for authentication. Press Enter to open this in your browser, or use the URL manually.\n");
+            try writeStdout("Waiting for authentication. press enter to open this in your browser, or use the URL manually.\n");
         } else {
             try writeStdout("Waiting for authentication...\n");
         }
@@ -1014,13 +1173,13 @@ fn fetchTeams(alloc: Allocator, access_token: []const u8, issuer_url: []const u8
     defer client.deinit();
 
     const e2e_endpoint = if (oauth_session.isLoopbackE2EIssuer(issuer_url))
-        try std.fmt.allocPrint(alloc, "{s}/v2/teams", .{issuer_url})
+        try alloc.print("{s}/v2/teams", .{issuer_url})
     else
         null;
     defer if (e2e_endpoint) |endpoint| alloc.free(endpoint);
     const endpoint = e2e_endpoint orelse teams_endpoint;
 
-    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{access_token});
+    const auth_header = try alloc.print("Bearer {s}", .{access_token});
     defer secret.zeroAndFree(alloc, auth_header);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -1048,7 +1207,7 @@ fn fetchTeamsFromJsHost(
     issuer_url: []const u8,
 ) !std.ArrayList(Team) {
     const e2e_endpoint = if (oauth_session.isLoopbackE2EIssuer(issuer_url))
-        try std.fmt.allocPrint(alloc, "{s}/v2/teams", .{issuer_url})
+        try alloc.print("{s}/v2/teams", .{issuer_url})
     else
         null;
     defer if (e2e_endpoint) |endpoint| alloc.free(endpoint);
@@ -1181,7 +1340,7 @@ fn renderTeamPicker(
     first_render: *bool,
 ) !void {
     if (!first_render.*) {
-        const move_up = try std.fmt.allocPrint(alloc, "\x1b[{d}A\r", .{teams.len});
+        const move_up = try alloc.print("\x1b[{d}A\r", .{teams.len});
         defer alloc.free(move_up);
         try writeStdout(move_up);
     }
@@ -1267,7 +1426,7 @@ const TeamPickerRawMode = struct {
         }
 
         var self = TeamPickerRawMode{};
-        self.original = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
+        self.original = try io_mod.tcgetattr(std.posix.STDIN_FILENO);
         var raw = self.original;
 
         raw.iflag.BRKINT = false;
@@ -1291,20 +1450,20 @@ const TeamPickerRawMode = struct {
             raw.cc[vtime_idx] = 0;
         }
 
-        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
+        try io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
         self.active = true;
         return self;
     }
 
     fn disable(self: *TeamPickerRawMode) void {
         if (!self.active) return;
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
         self.active = false;
     }
 };
 
 fn vminIndex() usize {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .linux => 6,
         .macos, .ios, .tvos, .watchos, .visionos => 16,
         .freebsd, .netbsd, .dragonfly, .openbsd => 16,
@@ -1313,7 +1472,7 @@ fn vminIndex() usize {
 }
 
 fn vtimeIndex() usize {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .linux => 5,
         .macos, .ios, .tvos, .watchos, .visionos => 17,
         .freebsd, .netbsd, .dragonfly, .openbsd => 17,
@@ -1383,8 +1542,47 @@ fn freeTeams(alloc: Allocator, teams: *std.ArrayList(Team)) void {
     teams.deinit(alloc);
 }
 
+fn checkBrowserPreparedAllocationFailures(alloc: Allocator) !void {
+    const token_endpoint = try alloc.dupe(u8, "https://issuer.test/token");
+    var token_endpoint_owned = true;
+    errdefer if (token_endpoint_owned) alloc.free(token_endpoint);
+    const verification_uri = try alloc.dupe(u8, "https://issuer.test/authorize?state=state");
+    var verification_uri_owned = true;
+    errdefer if (verification_uri_owned) alloc.free(verification_uri);
+
+    var prepared = try prepareBrowserLogin(alloc, .{
+        .issuer = "https://issuer.test",
+        .authorization_endpoint_suffix = "/authorize",
+        .token_endpoint = token_endpoint,
+        .verification_uri = verification_uri,
+        .client_id = "client",
+        .expires_in = 300,
+    });
+    token_endpoint_owned = false;
+    verification_uri_owned = false;
+    defer prepared.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "https://issuer.test/authorize",
+        prepared.metadata.device_authorization_endpoint,
+    );
+    try std.testing.expectEqualStrings(
+        "https://issuer.test/authorize?state=state",
+        prepared.device.verification_uri,
+    );
+    try std.testing.expectEqualStrings("client", prepared.client_id);
+}
+
+test "browser login preparation cleans up allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        testing_allocator.no_resize,
+        checkBrowserPreparedAllocationFailures,
+        .{},
+    );
+}
+
 test "team parsing cleans up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_parse_teams_allocation_failures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_parse_teams_allocation_failures, .{});
 }
 
 test "single team selection does not allocate" {
@@ -1396,13 +1594,78 @@ test "single team selection does not allocate" {
         .slug = &slug,
         .name = &name,
     }};
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
 
     try std.testing.expect((try selectTeam(failing.allocator(), &teams, null)) != null);
 }
 
+test "team selection stages an owned validation credential before commit" {
+    const alloc = std.testing.allocator;
+    var selection = TeamSelection{ .session = .{
+        .issuer = try alloc.dupe(u8, "https://vercel.com"),
+        .client_id = try alloc.dupe(u8, "client"),
+        .access_token = try alloc.dupe(u8, "access-token"),
+        .refresh_token = try alloc.dupe(u8, "refresh-token"),
+        .expires_at_ms = 100_000,
+        .scope = try alloc.dupe(u8, "openid offline_access"),
+        .token_type = try alloc.dupe(u8, "Bearer"),
+        .team_id = try alloc.dupe(u8, "team_old"),
+        .team_slug = try alloc.dupe(u8, "old-team"),
+    } };
+    defer selection.deinit(alloc);
+    try selection.teams.append(alloc, .{
+        .id = try alloc.dupe(u8, "team_new"),
+        .slug = try alloc.dupe(u8, "new-team"),
+        .name = try alloc.dupe(u8, "New Team"),
+    });
+
+    var candidate = try selection.validationCredential(alloc, 0);
+    defer candidate.deinit(alloc);
+
+    try std.testing.expectEqual(credentials.Source.fx_login, candidate.source);
+    try std.testing.expectEqualStrings("access-token", candidate.token);
+    try std.testing.expectEqualStrings("team_new", candidate.team_id.?);
+    try std.testing.expectEqualStrings("new-team", candidate.team_slug.?);
+    try std.testing.expectEqualStrings("team_old", selection.currentTeam().?);
+}
+
+test "team validation failure prevents the durable selection commit" {
+    const alloc = std.testing.allocator;
+    var selection = TeamSelection{ .session = .{
+        .issuer = try alloc.dupe(u8, "https://vercel.com"),
+        .client_id = try alloc.dupe(u8, "client"),
+        .access_token = try alloc.dupe(u8, "access-token"),
+        .refresh_token = try alloc.dupe(u8, "refresh-token"),
+        .expires_at_ms = 100_000,
+        .scope = try alloc.dupe(u8, "openid offline_access"),
+        .token_type = try alloc.dupe(u8, "Bearer"),
+        .team_id = try alloc.dupe(u8, "team_old"),
+        .team_slug = try alloc.dupe(u8, "old-team"),
+    } };
+    defer selection.deinit(alloc);
+    try selection.teams.append(alloc, .{
+        .id = try alloc.dupe(u8, "team_new"),
+        .slug = try alloc.dupe(u8, "new-team"),
+        .name = try alloc.dupe(u8, "New Team"),
+    });
+
+    const Reject = struct {
+        fn validate(
+            _: ?*anyopaque,
+            _: credentials.Credential,
+        ) std.mem.Allocator.Error!TeamValidationResult {
+            return .rejected;
+        }
+    };
+    try std.testing.expectError(
+        error.TeamValidationFailed,
+        validateAndSelectTeam(alloc, &selection, 0, .{ .validate_fn = Reject.validate }),
+    );
+    try std.testing.expectEqualStrings("team_old", selection.currentTeam().?);
+}
+
 test "login session transfer cleans up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_take_login_session_allocation_failures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_take_login_session_allocation_failures, .{});
 }
 
 fn readLine(alloc: Allocator) ![]u8 {
@@ -1418,7 +1681,7 @@ fn writeStdout(text: []const u8) !void {
 
 fn writeStdoutFmt(comptime fmt: []const u8, args: anytype) !void {
     var buf: [512]u8 = undefined;
-    const text = try std.fmt.bufPrint(&buf, fmt, args);
+    const text = try std.mem.print(&buf, fmt, args);
     try writeStdout(text);
 }
 
@@ -1452,6 +1715,8 @@ const LoginPollTestState = struct {
     open_available: bool = true,
     open_error: bool = false,
     now_ms: i64 = 0,
+    /// A sleep or wait that could not be recorded; the next poll reports it.
+    record_error: ?Allocator.Error = null,
 
     fn init(alloc: Allocator, results: []const ScriptedPollResult) LoginPollTestState {
         return .{ .alloc = alloc, .results = results };
@@ -1492,6 +1757,7 @@ const LoginPollTestState = struct {
         _: std.Io.Clock.Timestamp,
     ) !oauth.PollResult {
         const self = testState(raw);
+        if (self.record_error) |err| return err;
         if (self.poll_index >= self.results.len) return error.TestUnexpectedDevicePoll;
         const result = self.results[self.poll_index];
         self.poll_index += 1;
@@ -1504,13 +1770,17 @@ const LoginPollTestState = struct {
 
     fn testSleepMs(raw: ?*anyopaque, ms: u64) void {
         const self = testState(raw);
-        self.sleep_calls.append(self.alloc, ms) catch unreachable;
+        self.sleep_calls.append(self.alloc, ms) catch |err| {
+            self.record_error = err;
+        };
         self.now_ms += @intCast(ms);
     }
 
     fn testWaitForEnter(raw: ?*anyopaque, timeout_ms: u64) bool {
         const self = testState(raw);
-        self.wait_calls.append(self.alloc, timeout_ms) catch unreachable;
+        self.wait_calls.append(self.alloc, timeout_ms) catch |err| {
+            self.record_error = err;
+        };
         self.now_ms += @intCast(timeout_ms);
         return if (self.enter_on_wait) |index| self.wait_calls.items.len == index else false;
     }
@@ -1644,6 +1914,9 @@ const CooperativeSignInTestState = struct {
     complete_count: usize = 0,
     save_count: usize = 0,
     fail_save: bool = false,
+    finish_count: usize = 0,
+    finished_saved: bool = false,
+    saves_at_finish: usize = 0,
 
     fn init(alloc: Allocator, results: []const ScriptedPollResult) @This() {
         return .{ .poll = LoginPollTestState.init(alloc, results) };
@@ -1659,6 +1932,7 @@ const CooperativeSignInTestState = struct {
             .poll = self.poll.deps(),
             .complete = complete,
             .save = save,
+            .finish = finish,
         };
     }
 
@@ -1687,10 +1961,57 @@ const CooperativeSignInTestState = struct {
         if (self.fail_save) return error.TestStoreCommitFailed;
     }
 
+    fn finish(raw: ?*anyopaque, _: Allocator, saved: bool) void {
+        const self = state(raw);
+        self.finish_count += 1;
+        self.finished_saved = saved;
+        self.saves_at_finish = self.save_count;
+    }
+
     fn state(raw: ?*anyopaque) *@This() {
         return @ptrCast(@alignCast(raw.?));
     }
 };
+
+test "sign-in notifies once after persistence succeeds or fails" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |fail_save| {
+        var runtime: SignInRuntime = .{};
+        defer runtime.deinit(alloc);
+        var state = CooperativeSignInTestState.init(alloc, &.{.success});
+        defer state.deinit();
+        state.fail_save = fail_save;
+        try std.testing.expect(try runtime.startPreparedCooperative(alloc, try makeTestPreparedLogin(alloc), state.deps()));
+        try std.testing.expectEqual(@as(usize, 0), state.finish_count);
+        runtime.pulseCooperative(alloc);
+        try std.testing.expectEqual(@as(usize, 1), state.finish_count);
+        try std.testing.expectEqual(@as(usize, 1), state.saves_at_finish);
+        try std.testing.expectEqual(!fail_save, state.finished_saved);
+        var transition = runtime.pollTransition(alloc);
+        switch (transition) {
+            .succeeded => |*completion| completion.deinit(alloc),
+            .failed => try std.testing.expect(fail_save),
+            else => return error.TestExpectedTerminalSignIn,
+        }
+        _ = runtime.cancel(alloc);
+        try std.testing.expectEqual(@as(usize, 1), state.finish_count);
+    }
+}
+
+test "sign-in cancellation notifies failure without saving" {
+    const alloc = std.testing.allocator;
+    var runtime: SignInRuntime = .{};
+    defer runtime.deinit(alloc);
+    var state = CooperativeSignInTestState.init(alloc, &.{.success});
+    defer state.deinit();
+    try std.testing.expect(try runtime.startPreparedCooperative(alloc, try makeTestPreparedLogin(alloc), state.deps()));
+    try std.testing.expect(runtime.cancel(alloc));
+    try std.testing.expectEqual(@as(usize, 1), state.finish_count);
+    try std.testing.expectEqual(@as(usize, 0), state.saves_at_finish);
+    try std.testing.expect(!state.finished_saved);
+    _ = runtime.pollTransition(alloc);
+    try std.testing.expectEqual(@as(usize, 1), state.finish_count);
+}
 
 fn makeTestPreparedLogin(alloc: Allocator) !PreparedLogin {
     var metadata = try oauth.parseMetadata(
@@ -1798,7 +2119,7 @@ const WithholdingTokenFixture = struct {
     }
 
     fn tokenEndpoint(self: *@This(), alloc: Allocator) ![]u8 {
-        return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/oauth/token", .{
+        return alloc.print("http://127.0.0.1:{d}/oauth/token", .{
             self.server.socket.address.getPort(),
         });
     }
@@ -1835,9 +2156,9 @@ const WithholdingTokenFixture = struct {
 };
 
 fn makeLoopbackPreparedLogin(alloc: Allocator, token_endpoint: []const u8) !PreparedLogin {
-    const issuer = try alloc.dupe(u8, token_endpoint[0..std.mem.lastIndexOfScalar(u8, token_endpoint, '/').?]);
+    const issuer = try alloc.dupe(u8, token_endpoint[0..std.mem.findScalarLast(u8, token_endpoint, '/').?]);
     errdefer alloc.free(issuer);
-    const device_endpoint = try std.fmt.allocPrint(alloc, "{s}/device", .{issuer});
+    const device_endpoint = try alloc.print("{s}/device", .{issuer});
     errdefer alloc.free(device_endpoint);
     const owned_token_endpoint = try alloc.dupe(u8, token_endpoint);
     errdefer alloc.free(owned_token_endpoint);
@@ -1944,7 +2265,7 @@ test "cooperative sign-in store failure is traced and becomes a recoverable tran
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "sign-in-store-failure.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "sign-in-store-failure.log" });
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
     defer debug_trace.resetForTest();
@@ -1963,7 +2284,7 @@ test "cooperative sign-in store failure is traced and becomes a recoverable tran
     runtime.pulseCooperative(alloc);
 
     switch (runtime.pollTransition(alloc)) {
-        .failed => |err| try std.testing.expectEqual(error.TestStoreCommitFailed, err),
+        .failed => |err| try std.testing.expectEqual(error.CredentialPersistenceFailed, err),
         else => return error.TestExpectedStoreFailure,
     }
     debug_trace.shutdown();

@@ -2,9 +2,6 @@ const std = @import("std");
 const agent_stream_provider = @import("../stream_provider.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const types = @import("../../shared/types.zig");
-const session_usage = @import("../../session/session_usage.zig");
-const message = @import("../../shared/message.zig");
-const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const io_mod = @import("../../shared/io.zig");
 const runtime_telemetry = @import("telemetry.zig");
@@ -17,163 +14,84 @@ const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 pub const DeliveryCertainty = agent_stream_provider.DeliveryCertainty;
 pub const AttemptEvidence = agent_stream_provider.AttemptEvidence;
 
-pub const StreamResult = struct {
-    status: std.http.Status,
-    completion: types.GatewayCompletion = .{},
-    err_body: ?[]u8 = null,
-    retry_after_seconds: ?u64 = null,
+pub const StreamResult = agent_stream_provider.Result;
+
+/// A provider admits a request exactly once, before it can be sent.
+const InvocationAdmission = struct {
+    attempt_evidence: *AttemptEvidence,
+    trace_ctx: TraceContext,
+    model: []const u8,
+    caller_admission: agent_stream_provider.Admission,
+    admitted: bool = false,
+
+    fn admit(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.admitted) return error.ProviderAdmissionRepeated;
+        self.admitted = true;
+        if (self.caller_admission.admit_fn != null) {
+            try self.caller_admission.admit();
+        }
+        self.attempt_evidence.provider_admitted = true;
+        debug_trace.eventf(
+            "agent",
+            "provider_admitted",
+            self.trace_ctx,
+            "model={s}",
+            .{self.model},
+        );
+    }
 };
 
-pub fn streamGatewayCompletion(
+pub fn streamModelCompletion(
     provider: agent_stream_provider.Provider,
     alloc: Allocator,
-    api_key: []const u8,
-    credential_source: ?types.CredentialSource,
-    account_id: ?[]const u8,
-    team: ?[]const u8,
-    session_id: ?[]const u8,
-    model: []const u8,
-    retry_count: usize,
-    chat_url: []const u8,
-    payload: []const u8,
-    cooperative_pulse: ?agent_stream_provider.CooperativePulse,
-    delivery: *DeliveryCertainty,
-    attempt_evidence: *AttemptEvidence,
-    callback_ctx: *anyopaque,
-    on_content_chunk: agent_stream_provider.StreamCallback,
-    on_tool_start: ?agent_stream_provider.ToolStartCallback,
-    on_reasoning_chunk: ?agent_stream_provider.StreamCallback,
-    on_tool_input_chunk: ?agent_stream_provider.StreamCallback,
-    cancel_flag: *std.atomic.Value(bool),
-    usage: ?*session_usage.Usage,
-    usage_allocator: Allocator,
-    trace_ctx: TraceContext,
-    content_capture_limit: ?usize,
-    provider_attempt_owner: agent_stream_provider.ProviderAttemptOwner,
+    request_value: agent_stream_provider.ModelRequest,
 ) !StreamResult {
-    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (request_value.cancel_flag.load(.seq_cst)) {
+        return agent_stream_provider.failResult(error.Cancelled);
+    }
     const started_at_ms = io_mod.milliTimestamp();
-    const usage_observation = try session_usage.GatewayObservation.begin(usage);
-    attempt_evidence.provider_admitted = true;
-    var result = provider.stream(alloc, .{
-        .api_key = api_key,
-        .credential_source = credential_source,
-        .account_id = account_id,
-        .team = team,
-        .session_id = session_id,
-        .model = model,
-        .retry_count = retry_count,
-        .chat_url = chat_url,
-        .payload = payload,
-        .trace_ctx = trace_ctx,
-        .content_capture_limit = content_capture_limit,
-        .delivery = delivery,
-        .attempt_evidence = attempt_evidence,
-        .on_reasoning_chunk = on_reasoning_chunk,
-        .on_tool_input_chunk = on_tool_input_chunk,
-        .cooperative_pulse = cooperative_pulse,
-        .provider_attempt_owner = provider_attempt_owner,
-        .callback_ctx = callback_ctx,
-        .on_content_chunk = on_content_chunk,
-        .on_tool_start = on_tool_start,
-        .cancel_flag = cancel_flag,
-    }) catch |err| {
-        runtime_telemetry.recordGatewayCallMetric(model, started_at_ms, 0, 0, 0, 0, trace_ctx.turn_id, trace_ctx.step_id, trace_ctx.subagent_id, @errorName(err), "");
-        try usage_observation.fail(if (delivery.load() == .possibly_sent)
-            .ambiguous_delivery
-        else
-            .unbilled);
+    var admission = InvocationAdmission{
+        .attempt_evidence = request_value.attempt_evidence,
+        .trace_ctx = request_value.trace_ctx,
+        .model = request_value.model,
+        .caller_admission = request_value.admission,
+    };
+    var request = request_value;
+    request.admission = .{ .context = &admission, .admit_fn = InvocationAdmission.admit };
+    // Only the owned result escapes. HTTP and parser scratch is released after
+    // every attempt, including transport failure and cancellation.
+    var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer scratch.deinit();
+    const request_alloc = scratch.allocator();
+    var result = provider.stream(request_alloc, request) catch |err| {
+        runtime_telemetry.recordGatewayCallMetric(request.model, started_at_ms, 0, 0, 0, 0, request.trace_ctx.turn_id, request.trace_ctx.step_id, request.trace_ctx.subagent_id, @errorName(err), "");
         return err;
     };
-    defer result.deinit(alloc);
+    defer result.deinit(request_alloc);
+    if (!admission.admitted) return agent_stream_provider.failResult(error.ProviderAdmissionMissing);
 
-    recordGatewayResultMetric(
-        model,
-        started_at_ms,
-        result.status,
-        result.completion,
-        result.err_body,
-        result.failure_schema,
-        result.failure_request_shape,
-        trace_ctx,
-    );
-    try usage_observation.complete(
-        usage_allocator,
-        result.status,
-        result.completion,
-        result.generation_origin,
-        team,
-    );
-    if (comptime @import("builtin").os.tag != .wasi) {
-        if (result.reconcile_generation_usage) {
-            if (usage) |ledger| {
-                if (credential_source == .chatgpt_subscription or credential_source == .grok_subscription) {
-                    ledger.clearReconciliationCredential();
-                } else {
-                    ledger.startReconciliation(usage_allocator, api_key);
-                }
-            }
-        }
-    }
-
-    if (result.ownership == .borrowed) {
-        return .{
-            .status = result.status,
-            .completion = result.completion,
-            .err_body = result.err_body,
-            .retry_after_seconds = result.retry_after_seconds,
-        };
-    }
-
-    const tool_calls = try dupeGatewayToolCalls(alloc, result.completion.tool_calls);
-    errdefer message.freeToolCalls(alloc, tool_calls);
-    const content = if (result.completion.content) |content_text| try alloc.dupe(u8, content_text) else null;
-    errdefer if (content) |owned| alloc.free(owned);
-    const generation_id = if (result.completion.generation_id) |id| try alloc.dupe(u8, id) else null;
-    errdefer if (generation_id) |owned| alloc.free(owned);
-    const provider_failure_detail = if (result.completion.provider_failure_detail) |detail| try alloc.dupe(u8, detail) else null;
-    errdefer if (provider_failure_detail) |owned| alloc.free(owned);
-    const provider_state_json = if (result.completion.provider_state_json) |state| try alloc.dupe(u8, state) else null;
-    errdefer if (provider_state_json) |owned| alloc.free(owned);
-    const err_body = if (result.err_body) |body| try alloc.dupe(u8, body) else null;
-    errdefer if (err_body) |owned| alloc.free(owned);
-
-    const status = result.status;
-    const finish_reason = result.completion.finish_reason;
-    const completion_usage = result.completion.usage;
-    const delivery_ambiguous = result.completion.delivery_ambiguous;
-    const generation_metadata_invalid = result.completion.generation_metadata_invalid;
-    const provider_result_identity_failure = result.completion.provider_result_identity_failure;
-    const retry_after_seconds = result.retry_after_seconds;
-    return .{
-        .status = status,
-        .completion = .{
-            .content = content,
-            .tool_calls = tool_calls,
-            .generation_id = generation_id,
-            .generation_metadata_invalid = generation_metadata_invalid,
-            .delivery_ambiguous = delivery_ambiguous,
-            .provider_result_identity_failure = provider_result_identity_failure,
-            .provider_failure_detail = provider_failure_detail,
-            .provider_state_json = provider_state_json,
-            .finish_reason = finish_reason,
-            .usage = completion_usage,
-        },
-        .err_body = err_body,
-        .retry_after_seconds = retry_after_seconds,
+    recordProviderResultMetric(request.model, started_at_ms, result, request.trace_ctx);
+    return switch (result) {
+        .completed => |value| if (value.ownership == .borrowed) result else try result.dupe(alloc),
+        .failed => |value| if (value.ownership == .borrowed) result else try result.dupe(alloc),
     };
 }
 
-fn recordGatewayResultMetric(
+fn recordProviderResultMetric(
     model: []const u8,
     started_at_ms: i64,
-    status: std.http.Status,
-    completion: types.GatewayCompletion,
-    err_body: ?[]const u8,
-    failure_schema: ?[]const u8,
-    failure_request_shape: ?[]const u8,
+    result: agent_stream_provider.Result,
     trace_ctx: TraceContext,
 ) void {
+    const completion: types.ModelCompletion = switch (result) {
+        .completed => |value| value.completion,
+        .failed => .{},
+    };
+    const failure = switch (result) {
+        .completed => null,
+        .failed => |value| value,
+    };
     var response_bytes: u64 = 0;
     if (completion.content) |content| response_bytes += content.len;
     if (completion.provider_state_json) |state| response_bytes += state.len;
@@ -181,19 +99,18 @@ fn recordGatewayResultMetric(
         response_bytes += call.id.len + call.name.len + call.arguments_json.len;
         if (call.provider_result) |pr| response_bytes += pr.len;
     }
-    if (err_body) |body| response_bytes += body.len;
+    if (failure) |value| {
+        if (value.detail) |detail| response_bytes += detail.len;
+    }
     const truncated_bytes: u32 = @intCast(@min(response_bytes, std.math.maxInt(u32)));
     const input_tokens = clampTokenCount(completion.usage.input_tokens);
     const output_tokens = clampTokenCount(completion.usage.output_tokens);
-    const terminal_stop_reason = if (status == .ok)
-        if (completion.finish_reason) |reason| reason.label() else "missing_provider_finish"
-    else
-        "";
+    const terminal_stop_reason = if (completion.finish_reason) |reason| reason.label() else "";
 
     runtime_telemetry.recordGatewayCallMetricWithDiagnostics(
         model,
         started_at_ms,
-        @intFromEnum(status),
+        if (failure) |value| failureMetricCode(value.kind) else 200,
         truncated_bytes,
         input_tokens,
         output_tokens,
@@ -203,10 +120,86 @@ fn recordGatewayResultMetric(
         "",
         terminal_stop_reason,
         .{
-            .schema = failure_schema orelse "",
-            .request_shape = failure_request_shape orelse "",
+            .schema = if (failure) |value| value.diagnostics.schema orelse "" else "",
+            .request_shape = if (failure) |value| value.diagnostics.request_shape orelse "" else "",
         },
     );
+}
+
+test "gateway request scratch is released across success failure cancellation and retries" {
+    const Fake = struct {
+        mode: usize = 0,
+
+        fn stream(raw: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.ModelRequest) !StreamResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try request.admission.admit();
+            const payload = try alloc.alloc(u8, 64 * 1024);
+            defer alloc.free(payload);
+            @memset(payload, 'x');
+            const content = try alloc.dupe(u8, "owned response");
+            if (self.mode == 1 or self.mode == 2) {
+                defer alloc.free(content);
+                return if (self.mode == 1) error.ConnectionResetByPeer else error.Cancelled;
+            }
+            if (self.mode == 3) return .{ .failed = .{ .kind = .server_error, .detail = content, .ownership = .owned } };
+            return .{ .completed = .{ .completion = .{ .content = content }, .ownership = .owned } };
+        }
+
+        fn emit(_: *anyopaque, _: agent_stream_provider.Event) void {}
+    };
+    var turn = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer turn.deinit();
+    var fake: Fake = .{};
+    var cancel: std.atomic.Value(bool) = .init(false);
+    for (0..1000) |attempt| {
+        fake.mode = attempt % 4;
+        var delivery = DeliveryCertainty.init();
+        var evidence: AttemptEvidence = .{};
+        const result = streamModelCompletion(.{ .context = &fake, .stream_fn = Fake.stream }, turn.allocator(), .{
+            .credential = .{ .direct = .{ .secret_bytes = "fixture-key", .source = .ai_gateway_api_key } },
+            .model = "fixture-model",
+            .retry_count = 1,
+            .messages = &.{},
+            .tool_choice = .auto,
+            .provider_options = .{},
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &delivery,
+            .attempt_evidence = &evidence,
+            .events = .{ .context = &fake, .emit_fn = Fake.emit },
+            .cancel_flag = &cancel,
+            .provider_attempt_owner = .agent,
+        });
+        if (fake.mode == 1) {
+            try std.testing.expectError(error.ConnectionResetByPeer, result);
+        } else if (fake.mode == 2) {
+            try std.testing.expectError(error.Cancelled, result);
+        } else {
+            var owned = try result;
+            defer owned.deinit(turn.allocator());
+            const content = switch (owned) {
+                .completed => |completed| completed.completion.content.?,
+                .failed => |failure| failure.detail.?,
+            };
+            try std.testing.expectEqualStrings("owned response", content);
+        }
+        try std.testing.expect(turn.queryCapacity() < 128 * 1024);
+    }
+}
+
+fn failureMetricCode(kind: agent_stream_provider.FailureKind) u16 {
+    return switch (kind) {
+        .invalid_request => 400,
+        .unauthorized => 401,
+        .forbidden => 403,
+        .request_too_large => 413,
+        .rate_limited => 429,
+        .server_error => 500,
+        .bad_gateway => 502,
+        .unavailable => 503,
+        .gateway_timeout => 504,
+        .provider_error => 520,
+    };
 }
 
 fn clampTokenCount(value: ?u64) u32 {
@@ -214,78 +207,194 @@ fn clampTokenCount(value: ?u64) u32 {
     return @intCast(@min(t, std.math.maxInt(u32)));
 }
 
-fn dupeGatewayToolCalls(alloc: Allocator, source: anytype) ![]types.ToolCall {
-    if (source.len == 0) return &.{};
-    const copy = try alloc.alloc(types.ToolCall, source.len);
-    errdefer alloc.free(copy);
-
-    var copied: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < copied) : (i += 1) {
-            alloc.free(copy[i].id);
-            alloc.free(copy[i].name);
-            alloc.free(copy[i].arguments_json);
-            if (copy[i].provisional_id) |provisional_id| alloc.free(provisional_id);
-            if (copy[i].provider_result) |provider_result| alloc.free(provider_result);
-        }
-    }
-
-    for (source, 0..) |call, i| {
-        const id = try alloc.dupe(u8, call.id);
-        errdefer alloc.free(id);
-        const name = try alloc.dupe(u8, call.name);
-        errdefer alloc.free(name);
-        const arguments_json = try alloc.dupe(u8, call.arguments_json);
-        errdefer alloc.free(arguments_json);
-        const provisional_id = if (call.provisional_id) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (provisional_id) |value| alloc.free(value);
-        const provider_result = if (call.provider_result) |result| try alloc.dupe(u8, result) else null;
-        errdefer if (provider_result) |result| alloc.free(result);
-        copy[i] = .{
-            .id = id,
-            .name = name,
-            .arguments_json = arguments_json,
-            .argument_integrity = call.argument_integrity,
-            .provisional_id = provisional_id,
-            .provider_result = provider_result,
-            .final_identity = call.final_identity,
-            .provenance = call.provenance,
-        };
-        copied += 1;
-    }
-    return copy;
-}
-
-test "dupeGatewayToolCalls preserves argument integrity for shared agent admission" {
-    const source = [_]types.ToolCall{.{
-        .id = "call_1",
-        .name = "ask_user_question",
-        .arguments_json = "{}",
-        .argument_integrity = .malformed_json,
-    }};
-
-    const copy = try dupeGatewayToolCalls(std.testing.allocator, &source);
-    defer types.freeToolCallSlice(std.testing.allocator, copy);
-
-    try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, copy[0].argument_integrity);
-}
-
 pub const VisionToolMode = agent_stream_provider.VisionMode;
 
-pub fn recordSelectedDynamicTool(
+pub const ToolImageProjection = struct {
+    messages: []const types.ChatMessage,
+    /// True when at least one stored tool image was withheld from the request.
+    stripped: bool,
+};
+
+/// Projects stored tool images into the request only when the model accepts
+/// inline image input. Otherwise the images stay in the session image store
+/// and the tool message explains exactly why they were withheld and what the
+/// model can do instead, so the next step is never a dead end.
+pub fn projectToolImageMessages(
     alloc: Allocator,
-    names: *std.ArrayList([]const u8),
-    schemas: *std.ArrayList([]const u8),
-    execution: ToolExecutionResult,
-) !void {
-    const name = execution.selected_dynamic_tool_name orelse return;
-    const schema = execution.selected_dynamic_tool_schema_json orelse return;
-    for (names.items) |existing| {
-        if (std.mem.eql(u8, existing, name)) return;
+    messages: []const types.ChatMessage,
+    image_input_support: model_capabilities.ImageInputSupport,
+    vision_fallback_available: bool,
+    text_limit: usize,
+) !ToolImageProjection {
+    if (image_input_support == .native) return .{ .messages = messages, .stripped = false };
+    const has_images = for (messages) |message| {
+        if (message.tool_result_memory) |memory| if (memory.tool_images.len > 0 or memory.tool_image_handle != null) break true;
+    } else false;
+    if (!has_images) return .{ .messages = messages, .stripped = false };
+    const notice: []const u8 = switch (image_input_support) {
+        .native => unreachable,
+        .non_native => if (vision_fallback_available)
+            "[Tool images were retained but not sent: this model receives image input through the vision tool, not inline. Call vision with the image file's local path to inspect it.]\n"
+        else
+            "[Tool images were retained but not sent: this model does not accept inline images and no vision fallback is available. Ask the user to attach the image directly or switch to a vision-capable model.]\n",
+        .unknown => "[Tool images were retained but not sent: fx could not confirm image input support for this model (the model is not listed in the model catalog, or the catalog is unavailable). This can recover later in the session, so a retry may succeed; otherwise ask the user to attach the image directly.]\n",
+    };
+    const projected = try alloc.dupe(types.ChatMessage, messages);
+    for (projected) |*message| {
+        if (message.tool_result_memory) |*memory| {
+            if (memory.tool_images.len == 0 and memory.tool_image_handle == null) continue;
+            memory.tool_images = &.{};
+            const content = message.content orelse "";
+            const keep = @import("../../config/context_limits.zig").utf8PrefixLength(content, text_limit -| notice.len);
+            memory.truncated = memory.truncated or keep < content.len;
+            message.content = try std.mem.concat(alloc, u8, &.{ notice[0..@min(notice.len, text_limit)], content[0..keep] });
+        }
     }
-    try names.append(alloc, name);
-    try schemas.append(alloc, schema);
+    return .{ .messages = projected, .stripped = true };
+}
+
+test "projectToolImageMessages passes images through for native models" {
+    const alloc = std.testing.allocator;
+    const messages = [_]types.ChatMessage{.{
+        .role = .tool,
+        .content = "shot",
+        .tool_result_memory = .{ .tool_image_handle = @constCast("image-result-x") },
+    }};
+    const projected = try projectToolImageMessages(alloc, &messages, .native, false, 1024);
+    try std.testing.expect(!projected.stripped);
+    try std.testing.expect(projected.messages.ptr == (&messages).ptr);
+}
+
+test "projectToolImageMessages explains the vision fallback for non native models" {
+    const alloc = std.testing.allocator;
+    const messages = [_]types.ChatMessage{.{
+        .role = .tool,
+        .content = "shot",
+        .tool_result_memory = .{ .tool_image_handle = @constCast("image-result-x") },
+    }};
+    const projected = try projectToolImageMessages(alloc, &messages, .non_native, true, 1024);
+    defer {
+        for (projected.messages) |message| alloc.free(message.content.?);
+        alloc.free(projected.messages);
+    }
+    try std.testing.expect(projected.stripped);
+    const memory = projected.messages[0].tool_result_memory.?;
+    try std.testing.expectEqual(@as(usize, 0), memory.tool_images.len);
+    try std.testing.expect(std.mem.startsWith(u8, projected.messages[0].content.?, "[Tool images were retained but not sent: this model receives image input through the vision tool"));
+    try std.testing.expect(std.mem.find(u8, projected.messages[0].content.?, "shot") != null);
+}
+
+test "projectToolImageMessages tells the truth when the catalog is unavailable" {
+    const alloc = std.testing.allocator;
+    const messages = [_]types.ChatMessage{.{
+        .role = .tool,
+        .content = "shot",
+        .tool_result_memory = .{ .tool_image_handle = @constCast("image-result-x") },
+    }};
+    const projected = try projectToolImageMessages(alloc, &messages, .unknown, true, 1024);
+    defer {
+        for (projected.messages) |message| alloc.free(message.content.?);
+        alloc.free(projected.messages);
+    }
+    try std.testing.expect(projected.stripped);
+    const content = projected.messages[0].content.?;
+    try std.testing.expect(std.mem.find(u8, content, "could not confirm image input support") != null);
+    try std.testing.expect(std.mem.find(u8, content, "does not support image input") == null);
+}
+
+test "projectToolImageMessages names the dead end when no fallback exists" {
+    const alloc = std.testing.allocator;
+    const messages = [_]types.ChatMessage{.{
+        .role = .tool,
+        .content = "shot",
+        .tool_result_memory = .{ .tool_image_handle = @constCast("image-result-x") },
+    }};
+    const projected = try projectToolImageMessages(alloc, &messages, .non_native, false, 1024);
+    defer {
+        for (projected.messages) |message| alloc.free(message.content.?);
+        alloc.free(projected.messages);
+    }
+    try std.testing.expect(projected.stripped);
+    const content = projected.messages[0].content.?;
+    try std.testing.expect(std.mem.find(u8, content, "no vision fallback is available") != null);
+}
+
+test "projectToolImageMessages leaves image free history untouched" {
+    const alloc = std.testing.allocator;
+    const messages = [_]types.ChatMessage{.{
+        .role = .tool,
+        .content = "plain",
+    }};
+    const projected = try projectToolImageMessages(alloc, &messages, .unknown, false, 1024);
+    try std.testing.expect(!projected.stripped);
+    try std.testing.expect(projected.messages.ptr == (&messages).ptr);
+}
+
+pub fn snapshotDynamicTools(alloc: Allocator, deps: *const @import("deps.zig").AgentRuntimeDeps, selected: *std.ArrayList(agent_stream_provider.DynamicFunctionTool)) ![]const agent_stream_provider.DynamicFunctionTool {
+    var offered: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    errdefer offered.deinit(alloc);
+    const count = selected.items.len;
+    for (0..count) |index| {
+        const tool = selected.items[index];
+        if (tool.mcp_binding) |binding| {
+            const snapshot = deps.snapshot_mcp_definition orelse continue;
+            switch (try snapshot(deps.ctx, alloc, tool.name, binding)) {
+                .current => {},
+                .unavailable => continue,
+                .updated => |definition| {
+                    if (!std.mem.eql(u8, definition.name, tool.name) or definition.mcp_binding == null) return error.InvalidToolSchema;
+                    try recordSelectedDynamicTool(alloc, selected, definition);
+                    try offered.append(alloc, selected.items[index]);
+                    continue;
+                },
+            }
+        }
+        try offered.append(alloc, tool);
+    }
+    return offered.toOwnedSlice(alloc);
+}
+
+pub fn recordSelectedDynamicTools(alloc: Allocator, tools: *std.ArrayList(agent_stream_provider.DynamicFunctionTool), execution: ToolExecutionResult) !void {
+    for (execution.retired_dynamic_tool_names) |name| {
+        for (tools.items, 0..) |tool, index| {
+            if (std.mem.eql(u8, name, tool.name)) {
+                _ = tools.orderedRemove(index);
+                break;
+            }
+        }
+    }
+    for (execution.selected_dynamic_tools) |selected| try recordSelectedDynamicTool(alloc, tools, selected);
+}
+
+/// Adds or replaces one selected MCP definition. The parsed schema is
+/// allocated in `alloc`, which must outlive every step that advertises it.
+pub fn recordSelectedDynamicTool(alloc: Allocator, tools: *std.ArrayList(agent_stream_provider.DynamicFunctionTool), selected: @import("../../tooling/tool_mcp_runtime.zig").SelectedTool) !void {
+    const name = selected.name;
+    const schema_json = selected.schema_json;
+    const schema = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        alloc,
+        schema_json,
+        .{},
+    );
+    if (schema != .object) return error.InvalidToolSchema;
+    const schema_name = schema.object.get("name") orelse return error.InvalidToolSchema;
+    const description = schema.object.get("description") orelse return error.InvalidToolSchema;
+    const input_schema = schema.object.get("inputSchema") orelse return error.InvalidToolSchema;
+    if (schema_name != .string or description != .string or input_schema != .object or
+        !std.mem.eql(u8, schema_name.string, name))
+    {
+        return error.InvalidToolSchema;
+    }
+    for (tools.items) |*existing| {
+        if (std.mem.eql(u8, existing.name, name)) {
+            existing.description = description.string;
+            existing.input_schema = input_schema;
+            existing.mcp_binding = selected.mcp_binding;
+            return;
+        }
+    }
+    try tools.append(alloc, .{ .name = name, .description = description.string, .input_schema = input_schema, .mcp_binding = selected.mcp_binding });
 }
 
 pub fn gatewayHttpErrorDetail(
@@ -295,7 +404,7 @@ pub fn gatewayHttpErrorDetail(
     model: []const u8,
     capabilities: model_capabilities.Capabilities,
 ) ![]const u8 {
-    if (@intFromEnum(status) != 413) return detail;
+    if (@backingInt(status) != 413) return detail;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     if (detail.len > 0) try out.writer.print("{s}\n\n", .{detail});
@@ -340,109 +449,190 @@ test "gateway 413 detail reports selected model and only known limits" {
     try std.testing.expect(std.mem.find(u8, unknown, "max_output_tokens=") == null);
 }
 
-test "pre-send gateway failure settles usage as unbilled" {
+test "an unavailable provider fails before admission" {
     const Callbacks = struct {
-        fn content(_: *anyopaque, _: []const u8) void {}
+        fn event(_: *anyopaque, _: agent_stream_provider.Event) void {}
     };
 
     const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
     var cancel_flag = std.atomic.Value(bool).init(false);
     var delivery = DeliveryCertainty.init();
     var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
     var callback_ctx: u8 = 0;
-    const result = streamGatewayCompletion(
+    const result = streamModelCompletion(
         agent_stream_provider.unavailable_provider,
         alloc,
-        "test-key",
-        null,
-        null,
-        null,
-        null,
-        "test/model",
-        1,
-        "not a valid URL",
-        "{}",
-        null,
-        &delivery,
-        &attempt_evidence,
-        &callback_ctx,
-        Callbacks.content,
-        null,
-        null,
-        null,
-        &cancel_flag,
-        &usage,
-        alloc,
-        .{},
-        null,
-        .agent,
+        .{
+            .credential = .{ .direct = .{ .secret_bytes = "test-key" } },
+            .model = "test/model",
+            .retry_count = 1,
+            .messages = &.{},
+            .tool_choice = .auto,
+            .provider_options = .{},
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &delivery,
+            .attempt_evidence = &attempt_evidence,
+            .events = .{ .context = &callback_ctx, .emit_fn = Callbacks.event },
+            .cancel_flag = &cancel_flag,
+        },
     );
     if (result) |_| return error.TestExpectedGatewayFailure else |_| {}
-
-    var snapshot = try usage.snapshot(alloc);
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(session_usage.Availability.complete, snapshot.billing);
-    try std.testing.expect(snapshot.api_duration_complete);
-    try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
+    try std.testing.expect(!attempt_evidence.provider_admitted);
 }
 
-test "possibly sent gateway failure marks billing incomplete" {
-    const Gateway = struct {
+test "caller admission publishes before provider attempt is admitted" {
+    const CallerAdmission = struct {
+        calls: usize = 0,
+        attempt_evidence: *AttemptEvidence,
+
+        fn admit(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.attempt_evidence.provider_admitted);
+            self.calls += 1;
+        }
+    };
+    const Provider = struct {
+        opens: usize = 0,
+
         fn stream(
-            _: ?*anyopaque,
+            raw: ?*anyopaque,
             _: Allocator,
-            request: agent_stream_provider.Request,
+            request: agent_stream_provider.ModelRequest,
         ) anyerror!agent_stream_provider.Result {
-            request.delivery.markPossiblySent();
-            return error.ConnectionResetByPeer;
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try request.admission.admit();
+            self.opens += 1;
+            return .{ .completed = .{ .completion = .{ .finish_reason = .stop } } };
         }
     };
     const Callbacks = struct {
-        fn content(_: *anyopaque, _: []const u8) void {}
+        fn event(_: *anyopaque, _: agent_stream_provider.Event) void {}
     };
 
     const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
     var cancel_flag = std.atomic.Value(bool).init(false);
     var delivery = DeliveryCertainty.init();
-    var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
+    var attempt_evidence: AttemptEvidence = .{};
+    var caller_admission = CallerAdmission{ .attempt_evidence = &attempt_evidence };
+    var provider: Provider = .{};
     var callback_ctx: u8 = 0;
 
-    const result = streamGatewayCompletion(
-        .{ .stream_fn = Gateway.stream },
+    var result = try streamModelCompletion(
+        .{ .context = &provider, .stream_fn = Provider.stream },
         alloc,
-        "test-key",
-        null,
-        null,
-        null,
-        null,
-        "test/model",
-        1,
-        "https://example.test/chat",
-        "{}",
-        null,
-        &delivery,
-        &attempt_evidence,
-        &callback_ctx,
-        Callbacks.content,
-        null,
-        null,
-        null,
-        &cancel_flag,
-        &usage,
-        alloc,
-        .{},
-        null,
-        .agent,
+        .{
+            .credential = .{ .direct = .{ .secret_bytes = "test-key" } },
+            .model = "test/model",
+            .retry_count = 1,
+            .messages = &.{},
+            .tool_choice = .auto,
+            .provider_options = .{},
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &delivery,
+            .attempt_evidence = &attempt_evidence,
+            .events = .{ .context = &callback_ctx, .emit_fn = Callbacks.event },
+            .admission = .{ .context = &caller_admission, .admit_fn = CallerAdmission.admit },
+            .cancel_flag = &cancel_flag,
+        },
     );
-    if (result) |_| return error.TestExpectedGatewayFailure else |_| {}
+    defer result.deinit(alloc);
 
-    var snapshot = try usage.snapshot(alloc);
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(session_usage.Availability.incomplete, snapshot.billing);
-    try std.testing.expect(snapshot.api_duration_complete);
-    try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
+    try std.testing.expectEqual(@as(usize, 1), caller_admission.calls);
+    try std.testing.expectEqual(@as(usize, 1), provider.opens);
+    try std.testing.expect(attempt_evidence.provider_admitted);
+}
+
+test "caller admission failure prevents request open" {
+    const CallerAdmission = struct {
+        calls: usize = 0,
+
+        fn admit(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.InFlightPublicationFailed;
+        }
+    };
+    const Provider = struct {
+        opens: usize = 0,
+
+        fn stream(
+            raw: ?*anyopaque,
+            _: Allocator,
+            request: agent_stream_provider.ModelRequest,
+        ) anyerror!agent_stream_provider.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try request.admission.admit();
+            self.opens += 1;
+            return .{ .completed = .{ .completion = .{ .finish_reason = .stop } } };
+        }
+    };
+    const Callbacks = struct {
+        fn event(_: *anyopaque, _: agent_stream_provider.Event) void {}
+    };
+
+    const alloc = std.testing.allocator;
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var delivery = DeliveryCertainty.init();
+    var attempt_evidence: AttemptEvidence = .{};
+    var caller_admission: CallerAdmission = .{};
+    var provider: Provider = .{};
+    var callback_ctx: u8 = 0;
+
+    try std.testing.expectError(
+        error.InFlightPublicationFailed,
+        streamModelCompletion(
+            .{ .context = &provider, .stream_fn = Provider.stream },
+            alloc,
+            .{
+                .credential = .{ .direct = .{ .secret_bytes = "test-key" } },
+                .model = "test/model",
+                .retry_count = 1,
+                .messages = &.{},
+                .tool_choice = .auto,
+                .provider_options = .{},
+                .trace_ctx = .{},
+                .content_capture_limit = null,
+                .delivery = &delivery,
+                .attempt_evidence = &attempt_evidence,
+                .events = .{ .context = &callback_ctx, .emit_fn = Callbacks.event },
+                .admission = .{ .context = &caller_admission, .admit_fn = CallerAdmission.admit },
+                .cancel_flag = &cancel_flag,
+            },
+        ),
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), caller_admission.calls);
+    try std.testing.expectEqual(@as(usize, 0), provider.opens);
+    try std.testing.expect(!attempt_evidence.provider_admitted);
+}
+
+test "selected MCP schemas replace old definitions without duplicate names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    try recordSelectedDynamicTools(alloc, &tools, .{
+        .model_output = "selected",
+        .selected_dynamic_tools = &.{
+            .{ .name = "mcp_fixture_lookup", .schema_json =
+            \\{"name":"mcp_fixture_lookup","description":"Lookup","inputSchema":{"type":"object","properties":{"old_value":{"type":"string"}}}}
+            },
+            .{ .name = "mcp_fixture_other", .schema_json =
+            \\{"name":"mcp_fixture_other","description":"Other","inputSchema":{"type":"object"}}
+            },
+        },
+    });
+    try recordSelectedDynamicTools(alloc, &tools, .{
+        .model_output = "selected",
+        .selected_dynamic_tools = &.{.{ .name = "mcp_fixture_lookup", .schema_json =
+        \\{"name":"mcp_fixture_lookup","description":"Updated lookup","inputSchema":{"type":"object","properties":{"new_value":{"type":"string"}}}}
+        }},
+    });
+    try std.testing.expectEqual(@as(usize, 2), tools.items.len);
+    try std.testing.expectEqualStrings("Updated lookup", tools.items[0].description);
+    const properties = tools.items[0].input_schema.object.get("properties").?.object;
+    try std.testing.expect(properties.contains("new_value"));
+    try std.testing.expect(!properties.contains("old_value"));
 }

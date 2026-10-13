@@ -17,12 +17,12 @@ const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 const ApprovalPrompt = approval_prompt.ApprovalPrompt;
 const ApprovalProjection = approval_prompt.Projection;
 
-const file_approval_hint = "1–3 Choose now    ↑↓ Options    Tab Amend    Enter Confirm    Esc Cancel";
-const file_approval_navigation_hint = "1–3 Choose now    ↑↓ or Tab Options    Enter Confirm    Esc Cancel";
-const file_approval_screen_hint = "1–3 Choose now    ↑↓ Options    Tab Amend    Wheel Scroll    Enter Confirm    Esc Cancel";
-const file_approval_navigation_screen_hint = "1–3 Choose now    ↑↓ or Tab Options    Wheel Scroll    Enter Confirm    Esc Cancel";
-const file_approval_hint_compact = "1–3 Choose now    Enter Confirm    Esc Cancel";
-const file_approval_hint_minimal = "Enter Confirm    Esc Cancel";
+const file_approval_hint = "1–3 choose now    ↑↓ options    tab amend    enter confirm    esc cancel";
+const file_approval_navigation_hint = "1–3 choose now    ↑↓ or tab options    enter confirm    esc cancel";
+const file_approval_screen_hint = "1–3 choose now    ↑↓ options    tab amend    wheel scroll    enter confirm    esc cancel";
+const file_approval_navigation_screen_hint = "1–3 choose now    ↑↓ or tab options    wheel scroll    enter confirm    esc cancel";
+const file_approval_hint_compact = "1–3 choose now    enter confirm    esc cancel";
+const file_approval_hint_minimal = "enter confirm    esc cancel";
 // Ordered widest-first; every variant keeps the Enter/Esc controls so narrow
 // terminals never lose the submit and cancel instructions.
 const file_approval_hint_variants = [_][]const u8{ file_approval_hint, file_approval_hint_compact, file_approval_hint_minimal };
@@ -31,15 +31,15 @@ const file_approval_navigation_hint_variants = [_][]const u8{ file_approval_navi
 // is the only cue that the review document scrolls.
 const file_approval_screen_hint_variants = [_][]const u8{
     file_approval_screen_hint,
-    "1–3 Choose now    ↑↓ Options    Wheel Scroll    Enter Confirm    Esc Cancel",
-    "1–3 Choose    Wheel Scroll    Enter Confirm    Esc Cancel",
+    "1–3 choose now    ↑↓ options    wheel scroll    enter confirm    esc cancel",
+    "1–3 choose    wheel scroll    enter confirm    esc cancel",
     file_approval_hint_compact,
     file_approval_hint_minimal,
 };
 const file_approval_navigation_screen_hint_variants = [_][]const u8{
     file_approval_navigation_screen_hint,
-    "1–3 Choose now    ↑↓ Options    Wheel Scroll    Enter Confirm    Esc Cancel",
-    "1–3 Choose    Wheel Scroll    Enter Confirm    Esc Cancel",
+    "1–3 choose now    ↑↓ options    wheel scroll    enter confirm    esc cancel",
+    "1–3 choose    wheel scroll    enter confirm    esc cancel",
     file_approval_hint_compact,
     file_approval_hint_minimal,
 };
@@ -125,10 +125,6 @@ pub fn composeFileApprovalScreenRow(
             .complete = true,
         },
     };
-}
-
-pub fn approvalPanelRowsForLayout(shell: *const TranscriptRuntime) u16 {
-    return approvalPanelRowsForTerminalRows(shell.layout.rows);
 }
 
 pub fn inlineApprovalPanelRows(
@@ -485,7 +481,7 @@ pub fn projectFileApproval(
     if (target_count == 0) return result;
 
     var remaining = target_count;
-    var choice_selected = [_]bool{false} ** 3;
+    var choice_selected: [3]bool = @splat(false);
     const choice_rows = @min(@as(usize, 3), remaining);
     const choice_window = picker_presentation.pickerWindow(
         3,
@@ -503,7 +499,7 @@ pub fn projectFileApproval(
     if (question_selected) remaining -= 1;
 
     var preview_selected =
-        [_]bool{false} ** diff_mod.max_preview_lines;
+        @as([diff_mod.max_preview_lines]bool, @splat(false));
     var selected_preview_count: usize = 0;
     if (remaining > 0) {
         for (request.preview.lines[0..preview_count], 0..) |line, index| {
@@ -871,7 +867,7 @@ fn composeFileApprovalHeaderRow(
         try row.appendSlice(alloc, " · ");
         try row.appendSlice(alloc, ui_render.diff_added_style);
         var additions_buf: [32]u8 = undefined;
-        const additions = std.fmt.bufPrint(
+        const additions = std.mem.print(
             &additions_buf,
             "+{d}",
             .{request.preview.additions},
@@ -881,7 +877,7 @@ fn composeFileApprovalHeaderRow(
         try row.appendSlice(alloc, "  ");
         try row.appendSlice(alloc, ui_render.diff_removed_style);
         var deletions_buf: [32]u8 = undefined;
-        const deletions = std.fmt.bufPrint(
+        const deletions = std.mem.print(
             &deletions_buf,
             "-{d}",
             .{request.preview.deletions},
@@ -970,7 +966,7 @@ fn composeFileApprovalPreviewRow(
 
     const number = line.new_line orelse line.old_line orelse 0;
     var number_buf: [32]u8 = undefined;
-    const number_text = std.fmt.bufPrint(
+    const number_text = std.mem.print(
         &number_buf,
         "{d}",
         .{number},
@@ -1025,7 +1021,7 @@ fn composeFileApprovalHiddenPreviewRow(
     width: u16,
 ) !std.ArrayList(u8) {
     var text_buf: [96]u8 = undefined;
-    const text = std.fmt.bufPrint(
+    const text = std.mem.print(
         &text_buf,
         "⋯ {d} preview {s} hidden · resize to review",
         .{
@@ -1517,7 +1513,7 @@ fn buildApprovalPanelLineWithLabel(
         return switch (row_index) {
             0 => "  Permission needed · Choose one",
             1 => "",
-            2 => std.fmt.bufPrint(buf, "  {s}{s}{s}", .{ b, approvalQuestion(label, dynamic_mcp), r }) catch "  Permission request",
+            2 => std.mem.print(buf, "  {s}{s}{s}", .{ b, approvalQuestion(label, dynamic_mcp), r }) catch "  Permission request",
             3 => approvalReasonLine(buf, label, target, explanation, dynamic_mcp),
             4 => approvalActionLine(buf, label, target),
             5 => "",
@@ -1525,20 +1521,20 @@ fn buildApprovalPanelLineWithLabel(
             7 => approvalChoiceLine(buf, approval.choice_index == 1, approvalChoiceLabel(approval, 1)),
             8 => approvalChoiceLine(buf, approval.choice_index == 2, approvalChoiceLabel(approval, 2)),
             9 => "",
-            10 => std.fmt.bufPrint(buf, "  {s}{s}{s}", .{ dim, approvalHint(approval, width -| 2), r }) catch interaction_state.approval_hint,
+            10 => std.mem.print(buf, "  {s}{s}{s}", .{ dim, approvalHint(approval, width -| 2), r }) catch interaction_state.approval_hint,
             else => "",
         };
     }
 
     return switch (row_index) {
         0 => "  Permission needed · Choose one",
-        1 => std.fmt.bufPrint(buf, "  {s}{s}{s}", .{ b, approvalQuestion(label, dynamic_mcp), r }) catch "  Permission request",
+        1 => std.mem.print(buf, "  {s}{s}{s}", .{ b, approvalQuestion(label, dynamic_mcp), r }) catch "  Permission request",
         2 => approvalReasonLine(buf, label, target, explanation, dynamic_mcp),
         3 => approvalActionLine(buf, label, target),
         4 => approvalChoiceLine(buf, approval.choice_index == 0, approvalChoiceLabel(approval, 0)),
         5 => approvalChoiceLine(buf, approval.choice_index == 1, approvalChoiceLabel(approval, 1)),
         6 => approvalChoiceLine(buf, approval.choice_index == 2, approvalChoiceLabel(approval, 2)),
-        7 => std.fmt.bufPrint(buf, "  {s}{s}{s}", .{ dim, approvalHint(approval, width -| 2), r }) catch interaction_state.approval_hint,
+        7 => std.mem.print(buf, "  {s}{s}{s}", .{ dim, approvalHint(approval, width -| 2), r }) catch interaction_state.approval_hint,
         else => "",
     };
 }
@@ -1739,8 +1735,8 @@ fn approvalChoicePrefix(choice: u8) []const u8 {
 fn approvalHint(approval: ApprovalProjection, width: u16) []const u8 {
     if (approval.request.confirmation_only) {
         const confirmation_variants = [_][]const u8{
-            "1–2 Choose    Enter Confirm    Esc Cancel",
-            "Enter Confirm    Esc Cancel",
+            "1–2 choose    enter confirm    esc cancel",
+            "enter confirm    esc cancel",
         };
         return display_width.widestFitting(&confirmation_variants, width);
     }
@@ -1768,7 +1764,7 @@ fn approvalChoiceLine(buf: []u8, selected: bool, label: []const u8) []const u8 {
     const marker: []const u8 = if (selected) "❯ " else "  ";
     const label_style = if (selected) ui_render.tag_style else "";
     const suffix_style = if (selected) ui_render.reset_style else "";
-    return std.fmt.bufPrint(buf, "  {s}{s}{s}{s}", .{ marker, label_style, label, suffix_style }) catch label;
+    return std.mem.print(buf, "  {s}{s}{s}{s}", .{ marker, label_style, label, suffix_style }) catch label;
 }
 
 fn composeApprovalHeaderRow(
@@ -1833,8 +1829,7 @@ fn approvalTitle(
                 diff_mod.max_request_projection_bytes,
             );
             defer encoded.deinit(alloc);
-            const owned = try std.fmt.allocPrint(
-                alloc,
+            const owned = try alloc.print(
                 "Subagent {s} needs permission",
                 .{encoded.bytes},
             );
@@ -1847,13 +1842,9 @@ fn approvalKind(label: []const u8, dynamic_mcp: bool) []const u8 {
     if (std.mem.startsWith(u8, label, "Remember ") or
         std.mem.startsWith(u8, label, "Revoke saved-session")) return "Permission rule";
     if (dynamic_mcp) return "MCP tool";
-    if (std.mem.startsWith(u8, label, "terminal.exec ")) return "Command";
+    if (commandLabelPrefix(label) != null) return "Command";
     if (std.mem.startsWith(u8, label, "write_file ")) return "Write file";
     if (std.mem.startsWith(u8, label, "edit_file ")) return "Edit file";
-    if (std.mem.startsWith(u8, label, "delete_file ")) return "Delete file";
-    if (std.mem.startsWith(u8, label, "rename_file ")) return "Rename file";
-    if (std.mem.startsWith(u8, label, "copy_file ")) return "Copy file";
-    if (std.mem.startsWith(u8, label, "create_folder ")) return "Create folder";
     if (std.mem.startsWith(u8, label, "task ")) return "Subagent";
     if (std.mem.startsWith(u8, label, "skill ")) return "Skill";
     return "Tool";
@@ -1870,13 +1861,9 @@ fn approvalQuestion(label: []const u8, dynamic_mcp: bool) []const u8 {
         return "Revoke this saved-session permission rule?";
     }
     if (dynamic_mcp) return "Allow this MCP tool call?";
-    if (std.mem.startsWith(u8, label, "terminal.exec ")) return "Would you like to run the following command?";
+    if (commandLabelPrefix(label) != null) return "Would you like to run the following command?";
     if (std.mem.startsWith(u8, label, "write_file ")) return "Would you like to create or update this file?";
     if (std.mem.startsWith(u8, label, "edit_file ")) return "Would you like to edit this file?";
-    if (std.mem.startsWith(u8, label, "delete_file ")) return "Would you like to delete this file?";
-    if (std.mem.startsWith(u8, label, "rename_file ")) return "Would you like to rename this file?";
-    if (std.mem.startsWith(u8, label, "copy_file ")) return "Would you like to copy this file?";
-    if (std.mem.startsWith(u8, label, "create_folder ")) return "Would you like to create this folder?";
     if (std.mem.startsWith(u8, label, "task ")) return "Would you like to start this subagent task?";
     if (std.mem.startsWith(u8, label, "skill ")) return "Would you like to run this skill?";
     return "Would you like to allow this action?";
@@ -1884,13 +1871,9 @@ fn approvalQuestion(label: []const u8, dynamic_mcp: bool) []const u8 {
 
 fn approvalTarget(label: []const u8) []const u8 {
     const prefixes = [_][]const u8{
-        "terminal.exec ",
+        "shell.run ",
         "write_file ",
         "edit_file ",
-        "delete_file ",
-        "rename_file ",
-        "copy_file ",
-        "create_folder ",
         "task ",
         "skill ",
     };
@@ -1910,42 +1893,38 @@ fn approvalReasonLine(
     const dim = ui_render.dim_style;
     const r = ui_render.reset_style;
     if (explanation) |text| {
-        return std.fmt.bufPrint(buf, "  {s}{s}{s}", .{ dim, text, r }) catch "  Auto agent couldn’t approve because this request needs your review.";
+        return std.mem.print(buf, "  {s}{s}{s}", .{ dim, text, r }) catch "  Auto agent couldn’t approve because this request needs your review.";
     }
     if (approvalAnnotation(target)) |annotation| {
-        return std.fmt.bufPrint(buf, "  {s}Reason:{s} {s}", .{ dim, r, annotation }) catch "  Reason: permission required";
+        return std.mem.print(buf, "  {s}Reason:{s} {s}", .{ dim, r, annotation }) catch "  Reason: permission required";
     }
     if (dynamic_mcp) {
-        return std.fmt.bufPrint(
+        return std.mem.print(
             buf,
             "  {s}Reason:{s} This MCP tool needs approval before fx can send the request.",
             .{ dim, r },
         ) catch "  Reason: MCP tool approval required";
     }
-    if (std.mem.startsWith(u8, label, "terminal.exec ")) {
+    if (commandLabelPrefix(label) != null) {
         if (firstUrlHost(target)) |host| {
-            return std.fmt.bufPrint(buf, "  {s}Reason:{s} This command may make a network request to {s}.", .{ dim, r, host }) catch "  Reason: shell command requires approval";
+            return std.mem.print(buf, "  {s}Reason:{s} This command may make a network request to {s}.", .{ dim, r, host }) catch "  Reason: shell command requires approval";
         }
         return "";
     }
     if (std.mem.startsWith(u8, label, "write_file ") or
-        std.mem.startsWith(u8, label, "edit_file ") or
-        std.mem.startsWith(u8, label, "delete_file ") or
-        std.mem.startsWith(u8, label, "rename_file ") or
-        std.mem.startsWith(u8, label, "copy_file ") or
-        std.mem.startsWith(u8, label, "create_folder "))
+        std.mem.startsWith(u8, label, "edit_file "))
     {
-        return std.fmt.bufPrint(buf, "  {s}Reason:{s} This action changes files in your workspace.", .{ dim, r }) catch "  Reason: file change requires approval";
+        return std.mem.print(buf, "  {s}Reason:{s} This action changes files in your workspace.", .{ dim, r }) catch "  Reason: file change requires approval";
     }
-    return std.fmt.bufPrint(buf, "  {s}Reason:{s} This action needs approval before fx can continue.", .{ dim, r }) catch "  Reason: permission required";
+    return std.mem.print(buf, "  {s}Reason:{s} This action needs approval before fx can continue.", .{ dim, r }) catch "  Reason: permission required";
 }
 
 fn approvalActionLine(buf: []u8, label: []const u8, target: []const u8) []const u8 {
     const clean_target = approvalActionTarget(target);
-    if (std.mem.startsWith(u8, label, "terminal.exec ")) {
-        return std.fmt.bufPrint(buf, "  $ {s}", .{clean_target}) catch "  $";
+    if (commandLabelPrefix(label) != null) {
+        return std.mem.print(buf, "  $ {s}", .{clean_target}) catch "  $";
     }
-    return std.fmt.bufPrint(buf, "  {s}", .{clean_target}) catch "  permission request";
+    return std.mem.print(buf, "  {s}", .{clean_target}) catch "  permission request";
 }
 
 fn writeApprovalActionLine(
@@ -1955,7 +1934,7 @@ fn writeApprovalActionLine(
     width: u16,
 ) !void {
     const target = approvalActionTarget(approvalTarget(label));
-    if (std.mem.startsWith(u8, label, "terminal.exec ")) {
+    if (commandLabelPrefix(label) != null) {
         try writer.print("  $ {s}", .{target});
         return;
     }
@@ -1975,7 +1954,7 @@ fn writeApprovalActionLine(
 }
 
 pub fn commandTarget(label: []const u8) ?[]const u8 {
-    if (!std.mem.startsWith(u8, label, "terminal.exec ")) return null;
+    if (commandLabelPrefix(label) == null) return null;
     return approvalActionTarget(approvalTarget(label));
 }
 
@@ -1987,8 +1966,13 @@ fn approvalAlwaysChoice(approval: ApprovalProjection, label: []const u8) []const
     if (approval.request.tool_arguments_preview != null) {
         return "2. Allow this MCP tool for this session";
     }
-    if (std.mem.startsWith(u8, label, "terminal.exec ")) return "2. Yes, and don't ask again for this exact command";
+    if (commandLabelPrefix(label) != null) return "2. Yes, and don't ask again for this exact command";
     return "2. Yes, and don't ask again for this request";
+}
+
+fn commandLabelPrefix(label: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, label, "shell.run ")) return "shell.run ";
+    return null;
 }
 
 fn approvalActionTarget(target: []const u8) []const u8 {
@@ -2213,7 +2197,7 @@ test "file approval affirmative readiness requires settled committed geometry" {
 test "approval panel renders request context and numbered choices" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(std.testing.allocator);
-    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{ .label = "terminal.exec curl -I https://example.com" }));
+    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{ .label = "shell.run curl -I https://example.com" }));
     var row = try composeApprovalPanelRow(std.testing.allocator, prompt.projection().?, 120, 4, interaction_state.approval_panel_rows_spacious);
     defer row.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, row.items, "$ curl -I https://example.com") != null);
@@ -2280,19 +2264,19 @@ test "approval panel shows bounded terminal-safe tool arguments with ellipsis" {
 test "approval panel hint keeps enter and esc guidance at narrow widths" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(std.testing.allocator);
-    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{ .label = "terminal.exec echo hint" }));
+    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{ .label = "shell.run echo hint" }));
 
     var wide = try composeApprovalPanelRow(std.testing.allocator, prompt.projection().?, 120, 10, interaction_state.approval_panel_rows_spacious);
     defer wide.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, wide.items, "1–3 Choose now") != null);
-    try std.testing.expect(std.mem.find(u8, wide.items, "Tab Amend") != null);
-    try std.testing.expect(std.mem.find(u8, wide.items, "Esc Cancel") != null);
+    try std.testing.expect(std.mem.find(u8, wide.items, "1–3 choose now") != null);
+    try std.testing.expect(std.mem.find(u8, wide.items, "tab amend") != null);
+    try std.testing.expect(std.mem.find(u8, wide.items, "esc cancel") != null);
 
     prompt.decision.choice_index = 1;
     var navigation = try composeApprovalPanelRow(std.testing.allocator, prompt.projection().?, 120, 10, interaction_state.approval_panel_rows_spacious);
     defer navigation.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, navigation.items, "Tab Options") != null);
-    try std.testing.expect(std.mem.find(u8, navigation.items, "Tab Amend") == null);
+    try std.testing.expect(std.mem.find(u8, navigation.items, "tab options") != null);
+    try std.testing.expect(std.mem.find(u8, navigation.items, "tab amend") == null);
 
     _ = try prompt.decision.apply(
         std.testing.allocator,
@@ -2302,12 +2286,12 @@ test "approval panel hint keeps enter and esc guidance at narrow widths" {
     );
     var denial = try composeApprovalPanelRow(std.testing.allocator, prompt.projection().?, 120, 10, interaction_state.approval_panel_rows_spacious);
     defer denial.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, denial.items, "Tab Amend") != null);
+    try std.testing.expect(std.mem.find(u8, denial.items, "tab amend") != null);
 
     var narrow = try composeApprovalPanelRow(std.testing.allocator, prompt.projection().?, 60, 10, interaction_state.approval_panel_rows_spacious);
     defer narrow.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, narrow.items, "Enter Confirm") != null);
-    try std.testing.expect(std.mem.find(u8, narrow.items, "Esc Cancel") != null);
+    try std.testing.expect(std.mem.find(u8, narrow.items, "enter confirm") != null);
+    try std.testing.expect(std.mem.find(u8, narrow.items, "esc cancel") != null);
     try std.testing.expect(std.mem.find(u8, narrow.items, "Options") == null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow.items) <= 60);
 }
@@ -2316,9 +2300,9 @@ test "file approval hint keeps Enter and Esc guidance at narrow widths" {
     const alloc = std.testing.allocator;
     var row = try composeFileApprovalHintRow(alloc, null, 40);
     defer row.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, row.items, "Enter Confirm") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "Esc Cancel") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "Tab Amend") == null);
+    try std.testing.expect(std.mem.find(u8, row.items, "enter confirm") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "esc cancel") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "tab amend") == null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 40);
 }
 
@@ -2334,18 +2318,18 @@ test "file approval hints follow the selected amendment capability" {
     const projection = projectFileApproval(request, prompt.decision.choice_index, 120, fileApprovalDesiredRows(preview));
     var inline_hint = try composeFileApprovalRow(alloc, request, &projection, prompt.decision.choice_index, prompt.projection().?, 120, .hint);
     defer inline_hint.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, inline_hint.items, "Tab Options") != null);
-    try std.testing.expect(std.mem.find(u8, inline_hint.items, "Tab Amend") == null);
+    try std.testing.expect(std.mem.find(u8, inline_hint.items, "tab options") != null);
+    try std.testing.expect(std.mem.find(u8, inline_hint.items, "tab amend") == null);
 
     var screen = try composeFileApprovalScreenRow(alloc, request, .active_session, prompt.decision.choice_index, 120, .hint, true, true, prompt.projection().?);
     defer screen.text.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, screen.text.items, "Tab Options") != null);
-    try std.testing.expect(std.mem.find(u8, screen.text.items, "Wheel Scroll") != null);
+    try std.testing.expect(std.mem.find(u8, screen.text.items, "tab options") != null);
+    try std.testing.expect(std.mem.find(u8, screen.text.items, "wheel scroll") != null);
 
     prompt.decision.choice_index = 2;
     var denial = try composeFileApprovalScreenRow(alloc, request, .active_session, prompt.decision.choice_index, 120, .hint, true, true, prompt.projection().?);
     defer denial.text.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, denial.text.items, "Tab Amend") != null);
+    try std.testing.expect(std.mem.find(u8, denial.text.items, "tab amend") != null);
 }
 
 test "scrollable file approval hint keeps the wheel notice and Esc at 80 columns" {
@@ -2354,8 +2338,8 @@ test "scrollable file approval hint keeps the wheel notice and Esc at 80 columns
     const request: permission_request.FileApprovalRequest = .{ .kind = .edit, .intent = .mutation, .preview = preview, .scope = .workspace_files };
     var row = try composeFileApprovalScreenRow(alloc, request, .active_session, 0, 80, .hint, true, true, null);
     defer row.text.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, row.text.items, "Wheel Scroll") != null);
-    try std.testing.expect(std.mem.find(u8, row.text.items, "Esc Cancel") != null);
+    try std.testing.expect(std.mem.find(u8, row.text.items, "wheel scroll") != null);
+    try std.testing.expect(std.mem.find(u8, row.text.items, "esc cancel") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.text.items) <= 80);
 }
 
@@ -2363,7 +2347,7 @@ test "approval panel renders the shared auto-permission explanation as its reaso
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(std.testing.allocator);
     try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{
-        .label = "terminal.exec git reset --hard (risk: command may discard version-control state)",
+        .label = "shell.run git reset --hard (risk: command may discard version-control state)",
         .explanation = "Auto agent couldn’t approve because deterministic test decision",
     }));
     var reason_buf: [512]u8 = undefined;
@@ -2392,7 +2376,7 @@ test "ordinary command approval leaves the reason row blank" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(std.testing.allocator);
     try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{
-        .label = "terminal.exec zig build test",
+        .label = "shell.run zig build test",
         .command = "zig build test",
     }));
 
@@ -2413,7 +2397,7 @@ test "inline command panel wraps the complete target before its controls" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);
     try std.testing.expect(try prompt.syncRequest(alloc, .{
-        .label = "terminal.exec printf 'INLINE_COMMAND_START " ++ "x" ** 55 ++ " INLINE_COMMAND_END'",
+        .label = "shell.run printf 'INLINE_COMMAND_START " ++ text_utils.repeat("x", 55) ++ " INLINE_COMMAND_END'",
     }));
 
     const request = prompt.request.?.view();
@@ -2440,17 +2424,17 @@ test "inline command panel wraps the complete target before its controls" {
     try std.testing.expect(std.mem.find(u8, panel.items, "INLINE_COMMAND_START") != null);
     try std.testing.expect(std.mem.find(u8, panel.items, "INLINE_COMMAND_END") != null);
     try std.testing.expect(std.mem.find(u8, panel.items, interaction_state.approval_once_label) != null);
-    try std.testing.expect(std.mem.find(u8, panel.items, "Enter Confirm") == null);
-    try std.testing.expect(std.mem.find(u8, panel.items, "Esc Cancel") == null);
+    try std.testing.expect(std.mem.find(u8, panel.items, "enter confirm") == null);
+    try std.testing.expect(std.mem.find(u8, panel.items, "esc cancel") == null);
 }
 
 test "inline command panel uses full command when label is bounded" {
     const alloc = std.testing.allocator;
-    const command = "printf 'INLINE_FULL_COMMAND_START_" ++ ("x" ** 80) ++ "_INLINE_FULL_COMMAND_END'";
+    const command = "printf 'INLINE_FULL_COMMAND_START_" ++ text_utils.repeat("x", 80) ++ "_INLINE_FULL_COMMAND_END'";
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);
     try std.testing.expect(try prompt.syncRequest(alloc, .{
-        .label = "terminal.exec printf 'INLINE_FULL_COMMAND_START...",
+        .label = "shell.run printf 'INLINE_FULL_COMMAND_START...",
         .command = command,
     }));
 
@@ -2486,7 +2470,7 @@ test "inline command panel preserves hard newlines from the raw command" {
 
     var projection = (try projectInlineCommand(
         alloc,
-        "terminal.exec cat <<'EOF'...",
+        "shell.run cat <<'EOF'...",
         command,
         120,
     )).?;
@@ -2548,12 +2532,12 @@ test "inline command panel wraps commands at word boundaries" {
 test "inline command panel never truncates the complete command" {
     const alloc = std.testing.allocator;
     const command = "printf 'INLINE_UNBOUNDED_COMMAND_START_" ++
-        ("x" ** (diff_mod.max_request_projection_bytes + 64)) ++
+        text_utils.repeat("x", diff_mod.max_request_projection_bytes + 64) ++
         "_INLINE_UNBOUNDED_COMMAND_END'";
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);
     try std.testing.expect(try prompt.syncRequest(alloc, .{
-        .label = "terminal.exec printf 'INLINE_UNBOUNDED_COMMAND_START...",
+        .label = "shell.run printf 'INLINE_UNBOUNDED_COMMAND_START...",
         .command = command,
     }));
 
@@ -2594,7 +2578,7 @@ test "approval panel renders typed amendment in the selected choice row" {
     defer prompt.deinit(std.testing.allocator);
 
     try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{
-        .label = "terminal.exec printf done",
+        .label = "shell.run printf done",
     }));
     _ = try prompt.decision.apply(
         std.testing.allocator,
@@ -2629,7 +2613,7 @@ test "approval panel keeps the amendment tail and cursor visible" {
     defer prompt.deinit(alloc);
 
     try std.testing.expect(try prompt.syncRequest(alloc, .{
-        .label = "terminal.exec printf done",
+        .label = "shell.run printf done",
     }));
     _ = try prompt.decision.apply(alloc, .tab, prompt.request.?.amendment_allowed, null);
     try std.testing.expectEqual(
@@ -2696,7 +2680,7 @@ test "approval panel amendment starts with a dim placeholder and cursor" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(std.testing.allocator);
     try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{
-        .label = "terminal.exec printf done",
+        .label = "shell.run printf done",
     }));
     _ = try prompt.decision.apply(
         std.testing.allocator,
@@ -2714,8 +2698,8 @@ test "approval panel amendment starts with a dim placeholder and cursor" {
     );
     defer row.deinit(std.testing.allocator);
 
-    const cursor_start = std.mem.indexOf(u8, row.items, "\x1b[7ma") orelse return error.TestExpectedEqual;
-    const placeholder_remainder = std.mem.indexOf(u8, row.items, "nd tell fx what to do next") orelse return error.TestExpectedEqual;
+    const cursor_start = std.mem.find(u8, row.items, "\x1b[7ma") orelse return error.TestExpectedEqual;
+    const placeholder_remainder = std.mem.find(u8, row.items, "nd tell fx what to do next") orelse return error.TestExpectedEqual;
     try std.testing.expect(cursor_start < placeholder_remainder);
     try std.testing.expect(std.mem.find(u8, row.items, ui_render.statusline_style) != null);
 }
@@ -2723,7 +2707,7 @@ test "approval panel amendment starts with a dim placeholder and cursor" {
 test "approval panel encodes terminal controls in generic labels" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(std.testing.allocator);
-    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{ .label = "terminal.exec curl https://example.com\x1b[31m\n(risk: external)" }));
+    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{ .label = "shell.run curl https://example.com\x1b[31m\n(risk: external)" }));
     var row = try composeApprovalPanelRow(std.testing.allocator, prompt.projection().?, 120, 4, interaction_state.approval_panel_rows_spacious);
     defer row.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, row.items, "\\x1b[31m") != null);
@@ -2733,7 +2717,7 @@ test "approval panel encodes terminal controls in generic labels" {
 test "approval panel target row is single-line for heredoc command labels" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(std.testing.allocator);
-    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{ .label = "terminal.exec cat > ~/Desktop/hello-world.html <<'EOF'\n<!doctype html>\nEOF" }));
+    try std.testing.expect(try prompt.syncRequest(std.testing.allocator, .{ .label = "shell.run cat > ~/Desktop/hello-world.html <<'EOF'\n<!doctype html>\nEOF" }));
     var row = try composeApprovalPanelRow(std.testing.allocator, prompt.projection().?, 200, 4, interaction_state.approval_panel_rows_spacious);
     defer row.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.findScalar(u8, row.items, '\n') == null);
@@ -2745,7 +2729,7 @@ test "inline command rows account for terminal-safe escape width" {
     const alloc = std.testing.allocator;
     var label: std.ArrayList(u8) = .empty;
     defer label.deinit(alloc);
-    try label.appendSlice(alloc, "terminal.exec ");
+    try label.appendSlice(alloc, "shell.run ");
     try label.appendNTimes(alloc, 'x', 75);
     try label.append(alloc, '\n');
 
@@ -2759,7 +2743,7 @@ test "approval panel preserves a command beyond the fixed row buffer" {
     const alloc = std.testing.allocator;
     var label: std.ArrayList(u8) = .empty;
     defer label.deinit(alloc);
-    try label.appendSlice(alloc, "terminal.exec printf '%s' 'LONG_COMMAND_APPROVAL_START");
+    try label.appendSlice(alloc, "shell.run printf '%s' 'LONG_COMMAND_APPROVAL_START");
     try label.appendNTimes(alloc, 'x', row_text.max_top_row_len + 64);
     try label.appendSlice(alloc, "LONG_COMMAND_APPROVAL_END'");
 
@@ -2784,7 +2768,7 @@ test "generic approval uses compact permission header and pointer marker" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);
     try std.testing.expect(try prompt.syncRequest(alloc, .{
-        .label = "terminal.exec zig build test",
+        .label = "shell.run zig build test",
     }));
 
     var header = try composeApprovalPanelRow(
@@ -2820,7 +2804,7 @@ test "subagent approval header identifies requester and preserves command kind" 
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);
     try std.testing.expect(try prompt.syncRequest(alloc, .{
-        .label = "terminal.exec touch child-marker",
+        .label = "shell.run touch child-marker",
         .origin = .{ .subagent = "approval-child" },
     }));
 
@@ -2964,7 +2948,7 @@ test "permission hints use compact ask modal language" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);
     try std.testing.expect(try prompt.syncRequest(alloc, .{
-        .label = "terminal.exec zig build test",
+        .label = "shell.run zig build test",
     }));
 
     var generic = try composeApprovalPanelRow(
@@ -2978,15 +2962,15 @@ test "permission hints use compact ask modal language" {
     try std.testing.expect(std.mem.find(
         u8,
         generic.items,
-        "1–3 Choose now",
+        "1–3 choose now",
     ) != null);
-    try std.testing.expect(std.mem.find(u8, generic.items, "Tab Amend") != null);
+    try std.testing.expect(std.mem.find(u8, generic.items, "tab amend") != null);
     try std.testing.expect(std.mem.find(
         u8,
         generic.items,
-        "Enter Confirm",
+        "enter confirm",
     ) != null);
-    try std.testing.expect(std.mem.find(u8, generic.items, "Esc Cancel") != null);
+    try std.testing.expect(std.mem.find(u8, generic.items, "esc cancel") != null);
 
     const preview = diff_mod.FileChangePreview{
         .path = "note.txt",
@@ -3016,8 +3000,8 @@ test "permission hints use compact ask modal language" {
     try std.testing.expect(std.mem.find(
         u8,
         file.text.items,
-        "1–3 Choose now",
+        "1–3 choose now",
     ) != null);
-    try std.testing.expect(std.mem.find(u8, file.text.items, "Wheel Scroll") != null);
-    try std.testing.expect(std.mem.find(u8, file.text.items, "Tab Amend") != null);
+    try std.testing.expect(std.mem.find(u8, file.text.items, "wheel scroll") != null);
+    try std.testing.expect(std.mem.find(u8, file.text.items, "tab amend") != null);
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -46,7 +47,7 @@ pub const Target = union(Channel) {
     pub fn initStable(alloc: Allocator, raw_version: []const u8) !Target {
         const trimmed = std.mem.trim(u8, raw_version, " \t\r\n");
         const normalized_version = normalizeVersion(trimmed);
-        if (!validVersion(normalized_version)) return error.InvalidVersion;
+        if (!isValidVersion(normalized_version)) return error.InvalidVersion;
 
         const owned_version = try alloc.dupe(u8, normalized_version);
         errdefer alloc.free(owned_version);
@@ -75,7 +76,7 @@ pub const Target = union(Channel) {
 
         const normalized_version = normalizeVersion(version_value.string);
         const manifest_revision = revision_value.string;
-        if (!validVersion(normalized_version) or !validRevision(manifest_revision)) {
+        if (!isValidVersion(normalized_version) or !isValidRevision(manifest_revision)) {
             return error.InvalidManifest;
         }
 
@@ -83,7 +84,7 @@ pub const Target = union(Channel) {
         errdefer alloc.free(owned_version);
         const owned_revision = try alloc.dupe(u8, manifest_revision);
         errdefer alloc.free(owned_revision);
-        const artifact_ref = try std.fmt.allocPrint(alloc, "dev/{s}", .{manifest_revision});
+        const artifact_ref = try alloc.print("dev/{s}", .{manifest_revision});
         return .{ .dev = .{
             .version = owned_version,
             .revision = owned_revision,
@@ -141,8 +142,8 @@ pub const Target = union(Channel) {
 
     pub fn writeDisplayLabel(self: Target, out: []u8) ![]const u8 {
         return switch (self) {
-            .stable => |stable| std.fmt.bufPrint(out, "{s}", .{stable.version}),
-            .dev => |dev| std.fmt.bufPrint(out, "dev {s}", .{shortRevision(dev.revision)}),
+            .stable => |stable| std.mem.print(out, "{s}", .{stable.version}),
+            .dev => |dev| std.mem.print(out, "dev {s}", .{shortRevision(dev.revision)}),
         };
     }
 };
@@ -160,7 +161,7 @@ pub fn compareVersions(a: []const u8, b: []const u8) std.math.Order {
     return std.math.order(av[2], bv[2]);
 }
 
-fn validVersion(raw: []const u8) bool {
+pub fn isValidVersion(raw: []const u8) bool {
     if (raw.len == 0 or raw.len > max_version_bytes) return false;
     var count: usize = 0;
     var parts = std.mem.splitScalar(u8, raw, '.');
@@ -173,7 +174,7 @@ fn validVersion(raw: []const u8) bool {
     return count == 3;
 }
 
-fn validRevision(raw: []const u8) bool {
+pub fn isValidRevision(raw: []const u8) bool {
     if (raw.len < min_revision_bytes or raw.len > max_revision_bytes) return false;
     for (raw) |byte| if (!std.ascii.isHex(byte)) return false;
     return true;
@@ -189,7 +190,7 @@ fn parseVersionParts(raw: []const u8) [3]u32 {
     return values;
 }
 
-fn revisionsEqual(full: []const u8, current: []const u8) bool {
+pub fn revisionsEqual(full: []const u8, current: []const u8) bool {
     if (std.mem.eql(u8, current, "unknown")) return false;
     const common_len = @min(full.len, current.len);
     if (common_len < min_revision_bytes) return false;
@@ -236,7 +237,7 @@ test "dev manifest rejects malformed and oversized external data" {
     );
     try std.testing.expectError(
         error.ManifestTooLarge,
-        Target.parseDevManifest(alloc, " " ** (max_manifest_bytes + 1)),
+        Target.parseDevManifest(alloc, text_utils.repeat(" ", max_manifest_bytes + 1)),
     );
 }
 

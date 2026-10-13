@@ -1,4 +1,6 @@
 const std = @import("std");
+const file_picker_path = @import("../input/file_picker_path.zig");
+const login_flow = @import("../auth/login_flow.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
@@ -22,6 +24,30 @@ fn normalizeApprovalAmendmentPasteInPlace(bytes: []u8) []u8 {
     return normalized;
 }
 
+fn isBareImageSlashPrefix(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t");
+    return std.mem.eql(u8, trimmed, "/image") or std.mem.eql(u8, trimmed, "/img");
+}
+
+fn pastedImageSlashPrefixLen(text: []const u8) ?usize {
+    const trimmed = std.mem.trimStart(u8, text, " \t");
+    for ([_][]const u8{ "/image", "/img" }) |command| {
+        if (!std.mem.startsWith(u8, trimmed, command)) continue;
+        var index = text.len - trimmed.len + command.len;
+        if (index >= text.len or (text[index] != ' ' and text[index] != '\t')) continue;
+        while (index < text.len and (text[index] == ' ' or text[index] == '\t')) : (index += 1) {}
+        return index;
+    }
+    return null;
+}
+
+test "bare image slash prefix excludes image paths and other commands" {
+    try std.testing.expect(isBareImageSlashPrefix("/image "));
+    try std.testing.expect(isBareImageSlashPrefix("  /img\t"));
+    try std.testing.expect(!isBareImageSlashPrefix("/image photo.png"));
+    try std.testing.expect(!isBareImageSlashPrefix("/images clear"));
+}
+
 const ImagePasteStage = struct {
     replacement: std.ArrayList(u8) = .empty,
     images: std.ArrayList(types.ImageAttachment) = .empty,
@@ -37,8 +63,45 @@ const ImagePasteStage = struct {
     }
 };
 
+fn stripPastedImageSlashPrefix(stage: *ImagePasteStage) bool {
+    const prefix_len = pastedImageSlashPrefixLen(stage.replacement.items) orelse return false;
+    if (stage.tokens.items.len == 0 or stage.tokens.items[0].span.raw_start != prefix_len) return false;
+
+    const remaining = stage.replacement.items.len - prefix_len;
+    @memmove(stage.replacement.items[0..remaining], stage.replacement.items[prefix_len..]);
+    stage.replacement.items.len = remaining;
+    for (stage.tokens.items) |*token| {
+        token.span.raw_start -= prefix_len;
+        token.span.raw_end -= prefix_len;
+    }
+    return true;
+}
+
+test "pasted image slash removes only a prefix before a captured path" {
+    const alloc = std.testing.allocator;
+    var stage: ImagePasteStage = .{};
+    defer stage.deinit(alloc);
+    try stage.replacement.appendSlice(alloc, "/image [Image #1] Describe");
+    try stage.tokens.append(alloc, .{ .id = 1, .span = .{ .raw_start = 7, .raw_end = 17 } });
+    try std.testing.expect(stripPastedImageSlashPrefix(&stage));
+    try std.testing.expectEqualStrings("[Image #1] Describe", stage.replacement.items);
+    try std.testing.expectEqual(entity_spans.Span{ .raw_start = 0, .raw_end = 10 }, stage.tokens.items[0].span);
+
+    stage.replacement.clearRetainingCapacity();
+    stage.tokens.clearRetainingCapacity();
+    try stage.replacement.appendSlice(alloc, "/image missing.png");
+    try std.testing.expect(!stripPastedImageSlashPrefix(&stage));
+    try std.testing.expectEqualStrings("/image missing.png", stage.replacement.items);
+}
+
 pub fn PasteEditRuntime(comptime App: type) type {
     return struct {
+        fn authCodeEntryActive(app: *const App) bool {
+            if (comptime !@hasField(App, "auth") or
+                !@hasDecl(@TypeOf(app.auth), "signInCodeEntryActive")) return false;
+            return app.auth.signInCodeEntryActive();
+        }
+
         pub fn beginPaste(app: *App, max_input_len: usize) void {
             const owner: paste_framing.Owner = if (app.question_prompt.isActive())
                 if (app.question_prompt.isFreeformSelected()) .question_freeform else .decision_prompt
@@ -46,10 +109,13 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 .approval_amendment
             else if (app.approval_prompt.isActive())
                 .decision_prompt
+            else if (authCodeEntryActive(app))
+                .auth_code
             else
                 .composer;
             const buffer_limit = switch (owner) {
                 .composer => app.input_runtime.replacementState(&app.pending_images).availableBytesForSelectionOrInsertion(max_input_len),
+                .auth_code => login_flow.max_manual_code_bytes,
                 .none, .decision_prompt, .question_freeform, .approval_amendment => max_input_len,
             };
 
@@ -73,6 +139,13 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 debug_trace.logf(
                     "input",
                     "event=esc_clear_disarmed reason=pending_gesture_reset",
+                    .{},
+                );
+            }
+            if (gesture_reset.cleared_escape_interrupt) {
+                debug_trace.logf(
+                    "input",
+                    "event=esc_interrupt_disarmed reason=pending_gesture_reset",
                     .{},
                 );
             }
@@ -108,7 +181,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     const render_reason: render_request.Reason = switch (owner) {
                         .composer => .footer,
                         .decision_prompt, .question_freeform, .approval_amendment => .modal,
-                        .none => return false,
+                        .none, .auth_code => .footer,
                     };
                     app.input_runtime.paste.resetWithTrace(.unsafe_suffix);
                     app.shell.render_requests.request(render_reason);
@@ -122,14 +195,33 @@ pub fn PasteEditRuntime(comptime App: type) type {
             return true;
         }
 
+        /// Resets the paste after `owner` failed to take it and returns `err`.
+        fn failPaste(app: *App, owner: paste_framing.Owner, err: anytype) @TypeOf(err) {
+            app.input_runtime.paste.resetWithTrace(.{ .finalize_failed = .{
+                .owner = owner,
+                .error_name = @errorName(err),
+            } });
+            return err;
+        }
+
         pub fn finishPaste(app: *App, max_input_len: usize) !void {
             if (app.input_runtime.paste.overflow_bytes > 0) {
                 const attempted_bytes = app.input_runtime.paste.attemptedBytes();
+                if (app.input_runtime.paste.owner == .auth_code) {
+                    app.input_runtime.paste.resetSecretWithTrace(.{ .input_limit = .auth_code });
+                    app.shell.render_requests.request(.footer);
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "The authorization code is too long.",
+                    }, true);
+                    return;
+                }
                 const owner: text_scalar.Owner = switch (app.input_runtime.paste.owner) {
                     .composer => .composer,
                     .question_freeform => .question_freeform,
                     .approval_amendment => .approval_amendment,
-                    .none, .decision_prompt => unreachable,
+                    .none, .decision_prompt, .auth_code => unreachable,
                 };
                 app.input_runtime.paste.resetWithTrace(.{ .input_limit = switch (owner) {
                     .composer => .composer,
@@ -149,6 +241,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     const normalized = normalizeApprovalAmendmentPasteInPlace(app.input_runtime.paste.buffer.items);
                     app.input_runtime.paste.buffer.items.len = normalized.len;
                 },
+                .auth_code => {},
                 else => {},
             }
 
@@ -175,15 +268,12 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 .decision_prompt => app.input_runtime.paste.resetWithTrace(.decision_prompt_active),
                 .question_freeform => {
                     if (comptime @hasField(App, "question_prompt")) {
-                        errdefer |err| app.input_runtime.paste.resetWithTrace(.{ .finalize_failed = .{
-                            .owner = .question_freeform,
-                            .error_name = @errorName(err),
-                        } });
-                        switch (try app.question_prompt.insertFreeformSlice(
+                        const outcome = app.question_prompt.insertFreeformSlice(
                             app.alloc,
                             app.input_runtime.paste.buffer.items,
                             max_input_len,
-                        )) {
+                        ) catch |err| return failPaste(app, .question_freeform, err);
+                        switch (outcome) {
                             .inserted => {
                                 app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
                                 app.input_runtime.paste.finishHandled();
@@ -193,7 +283,8 @@ pub fn PasteEditRuntime(comptime App: type) type {
                             .limit_exceeded => {
                                 const attempted_bytes = app.input_runtime.paste.buffer.items.len;
                                 app.input_runtime.paste.resetWithTrace(.{ .input_limit = .question_freeform });
-                                try input_limit_feedback.report(App, app, .question_freeform, attempted_bytes);
+                                input_limit_feedback.report(App, app, .question_freeform, attempted_bytes) catch |err|
+                                    return failPaste(app, .question_freeform, err);
                             },
                         }
                     } else {
@@ -214,15 +305,12 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 },
                 .approval_amendment => {
                     if (comptime @hasField(App, "approval_prompt")) {
-                        errdefer |err| app.input_runtime.paste.resetWithTrace(.{ .finalize_failed = .{
-                            .owner = .approval_amendment,
-                            .error_name = @errorName(err),
-                        } });
-                        switch (try app.approval_prompt.decision.insertAmendmentSlice(
+                        const outcome = app.approval_prompt.decision.insertAmendmentSlice(
                             app.alloc,
                             app.input_runtime.paste.buffer.items,
                             max_input_len,
-                        )) {
+                        ) catch |err| return failPaste(app, .approval_amendment, err);
+                        switch (outcome) {
                             .inserted => app.input_runtime.input_limit_rejection = input_limit_rejection.clear(),
                             .inactive => {
                                 app.input_runtime.paste.resetWithTrace(.session_reset);
@@ -231,7 +319,8 @@ pub fn PasteEditRuntime(comptime App: type) type {
                             .limit_exceeded => {
                                 const attempted_bytes = app.input_runtime.paste.buffer.items.len;
                                 app.input_runtime.paste.resetWithTrace(.{ .input_limit = .approval_amendment });
-                                try input_limit_feedback.report(App, app, .approval_amendment, attempted_bytes);
+                                input_limit_feedback.report(App, app, .approval_amendment, attempted_bytes) catch |err|
+                                    return failPaste(app, .approval_amendment, err);
                                 return;
                             },
                         }
@@ -241,7 +330,42 @@ pub fn PasteEditRuntime(comptime App: type) type {
                         app.input_runtime.paste.resetWithTrace(.session_reset);
                     }
                 },
+                .auth_code => {
+                    if (comptime @hasField(App, "auth") and
+                        @hasDecl(@TypeOf(app.auth), "replaceSignInCodeInput"))
+                    {
+                        const accepted = try app.auth.replaceSignInCodeInput(
+                            app.alloc,
+                            app.input_runtime.paste.buffer.items,
+                        );
+                        if (!accepted) {
+                            app.input_runtime.paste.resetSecretWithTrace(.session_reset);
+                            try app.writeDomainNotice(.{
+                                .topic = "auth",
+                                .tone = .@"error",
+                                .body = "The authorization code is invalid.",
+                            }, true);
+                            return;
+                        }
+                        app.input_runtime.paste.beginHandling();
+                        app.input_runtime.paste.finishSecretHandled();
+                        app.shell.render_requests.request(.footer);
+                    } else {
+                        app.input_runtime.paste.resetSecretWithTrace(.session_reset);
+                    }
+                },
             }
+        }
+
+        /// The model picker lends the composer out as its query box: the
+        /// catalog, then a Ctrl+P flow's inline stages. An image attached
+        /// there would outlive the query, so image input stays out of it.
+        pub fn modelPickerBorrowsComposer(app: *const App) bool {
+            if (comptime @hasField(@TypeOf(app.input_runtime), "model_picker_draft")) {
+                if (app.input_runtime.model_picker_draft != null) return true;
+            }
+            if (comptime !@hasField(App, "model_cache")) return false;
+            return app.model_cache.menu.active;
         }
 
         pub fn finalizePastedBlock(app: *App, max_input_len: usize) !void {
@@ -249,9 +373,12 @@ pub fn PasteEditRuntime(comptime App: type) type {
 
             // Inline image paths create pending attachments, not pasted-text blocks.
             if (image_attachments.hasImagePathToken(app.input_runtime.paste.buffer.items)) {
-                try handlePastedBytes(app, app.input_runtime.paste.buffer.items, max_input_len);
-                app.input_runtime.paste.buffer.clearRetainingCapacity();
-                return;
+                if (!modelPickerBorrowsComposer(app)) {
+                    try handlePastedBytes(app, app.input_runtime.paste.buffer.items, max_input_len);
+                    app.input_runtime.paste.buffer.clearRetainingCapacity();
+                    return;
+                }
+                debug_trace.logf("input", "image path paste kept as text reason=model_picker_borrows_composer", .{});
             }
 
             const text = try app.alloc.dupe(u8, app.input_runtime.paste.buffer.items);
@@ -334,10 +461,10 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 i = image_attachments.nextShellTokenEnd(bytes, start);
                 const raw = bytes[start..i];
                 if (image_attachments.splitImagePathToken(raw)) |token| {
-                    const maybe_img = image_attachments.loadUserImageAttachment(
+                    const maybe_img = image_attachments.load_inline_image_attachment(
                         app.alloc,
                         app.workspace_root,
-                        token.path,
+                        token,
                     ) catch |err| switch (err) {
                         error.OutOfMemory => return err,
                         error.ImageTooLarge => blk: {
@@ -384,6 +511,12 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 }
             }
             try stage.replacement.appendSlice(app.alloc, bytes[prev..]);
+            if (app.input_runtime.edit_state.input.items.len == 0 and
+                app.pending_images.items.len == 0 and
+                stripPastedImageSlashPrefix(&stage))
+            {
+                debug_trace.logf("input", "event=image_slash_prefix_consumed reason=pasted_slash_command", .{});
+            }
 
             const image_count = stage.images.items.len;
             const start = if (app.input_runtime.edit_state.selectionRange()) |selection|
@@ -442,7 +575,15 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 );
             }
 
-            const structured_start = start;
+            const consume_image_slash = app.pending_images.items.len == 0 and
+                app.input_runtime.edit_state.selectionRange() == null and
+                start == app.input_runtime.edit_state.input.items.len and
+                isBareImageSlashPrefix(app.input_runtime.edit_state.input.items);
+            if (consume_image_slash) {
+                debug_trace.logf("input", "event=image_slash_prefix_consumed reason=pasted_image_attachment", .{});
+                app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            }
+            const structured_start: usize = if (consume_image_slash) 0 else start;
             std.debug.assert(try replacement.replaceSelectionOrInsertSliceBounded(
                 app.alloc,
                 stage.replacement.items,
@@ -502,7 +643,19 @@ pub fn PasteEditRuntime(comptime App: type) type {
             const input = app.input_runtime.edit_state.input.items;
             var index = @min(start, input.len);
             const limit = @min(end, input.len);
+            var paths: file_picker_path.Iterator = .{ .text = input };
+            var protected = paths.next();
             while (index < limit) : (index += 1) {
+                while (protected) |path| {
+                    if (index < path.end) break;
+                    protected = paths.next();
+                }
+                if (protected) |path| {
+                    if (index >= path.start) {
+                        index = path.end - 1;
+                        continue;
+                    }
+                }
                 if (input[index] != '$') continue;
                 const query_start = index + 1;
                 const query_end = skillTokenEnd(input, query_start);

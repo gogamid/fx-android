@@ -1,6 +1,10 @@
 const std = @import("std");
+const builtin_tools = @import("../../../../builtins/tools.zig");
+const model_tool_schema = @import("../../../tooling/model_tool_schema.zig");
 const types = @import("../../../shared/types.zig");
 const session_runtime = @import("../../../session/session.zig");
+const session_child_store = @import("../../../session/session_child_store.zig");
+const command_replay_store = @import("../../../session/command_replay_store.zig");
 const debug_trace = @import("../../../shared/debug_trace.zig");
 const io_mod = @import("../../../shared/io.zig");
 
@@ -12,8 +16,8 @@ const ToolCall = types.ToolCall;
 
 const removed_direct_question_guidance = "Treat it as interrupting any previous tool plan.";
 const removed_resume_guidance = "Continue from the latest meaningful state";
-const fixture_tools_json =
-    "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read a file\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
+const read_file_advertised_names = [_][]const u8{"read_file"};
+const read_file_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.read_file.model_schema};
 
 const FakeCompletion = test_support.FakeCompletion;
 const FakeGateway = test_support.FakeGateway;
@@ -109,13 +113,14 @@ test "processQueuedPrompt sends former intent text normally with tools" {
         var job = fixture.job();
         job.prompt = @constCast(text);
         var config = fixture.config();
-        config.gateway_tools_json = fixture_tools_json;
+        config.advertised_tool_names = &read_file_advertised_names;
+        config.advertised_functions = &read_file_advertised_functions;
 
         try runFakePrompt(&gateway, &hooks, config, job);
 
         const body = gateway.request_bodies.items[0];
-        const runtime_idx = std.mem.indexOf(u8, body, "runtime context unique") orelse return error.TestExpectedEqual;
-        const current_idx = std.mem.indexOf(u8, body, text) orelse return error.TestExpectedEqual;
+        const runtime_idx = std.mem.find(u8, body, "runtime context unique") orelse return error.TestExpectedEqual;
+        const current_idx = std.mem.find(u8, body, text) orelse return error.TestExpectedEqual;
         try std.testing.expect(runtime_idx < current_idx);
         try expectGatewayPromptFinalUserText(&gateway, 0, text);
         try expectBodyContains(&gateway, 0, "\"name\":\"read_file\"");
@@ -163,6 +168,43 @@ test "processQueuedPrompt persists partial-text cancellation as interrupted once
     try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
     try std.testing.expectEqualStrings("Partial answer", hooks.history_turns.items[0].interrupted.assistant.?);
     try std.testing.expect(hooks.history_turns.items[0].interrupted.tool_call == null);
+}
+
+test "automatic text steering resumes the same turn without interrupted history" {
+    const alloc = std.testing.allocator;
+    const chunks = [_][]const u8{"Partial answer"};
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &chunks, .cancel_after_chunks = true },
+        .{ .content = "Updated answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    const steering = [_][]const u8{ "first update", "second update" };
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    hooks.immediate_steering_messages = &steering;
+    hooks.immediate_steering_cancel_flag = &fixture.cancel_flag;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 1, &.{
+        "Partial answer",
+        "user_steering",
+        "first update",
+        "user_steering",
+        "second update",
+    });
+    try std.testing.expectEqual(@as(usize, 0), hooks.interrupted_history_count);
+    try std.testing.expectEqual(@as(usize, 0), hooks.interrupted_event_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .assistant);
+    try std.testing.expectEqualStrings("Updated answer", hooks.finish_assistant_text.?);
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 2), execution.steering.len);
+    try std.testing.expectEqualStrings("first update", execution.steering[0].text);
+    try std.testing.expectEqualStrings("second update", execution.steering[1].text);
 }
 
 test "streamed presentation preserves raw partial through cancellation" {
@@ -218,6 +260,30 @@ test "streamed presentation preserves raw partial through cancellation" {
             try std.testing.expectEqual(@as(usize, 0), hooks.texts.items.len);
         }
     }
+}
+
+test "clear language mismatch is absent from cancelled history" {
+    const alloc = std.testing.allocator;
+    const chunks = [_][]const u8{"我会先检查锁文件和依赖清单。"};
+    const completions = [_]FakeCompletion{.{
+        .chunks = &chunks,
+        .cancel_after_chunks = true,
+    }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.prompt = @constCast("The lockfile is broken again.");
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
+    try std.testing.expect(hooks.history_turns.items[0].interrupted.assistant == null);
+    try std.testing.expectEqual(@as(usize, 0), hooks.assistant_sources.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.texts.items.len);
 }
 
 test "processQueuedPrompt cancellation after valid tool finish settles streamed calls" {
@@ -293,7 +359,7 @@ test "processQueuedPrompt persists completed tool names when cancelled during ne
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "completed-tools-interrupt.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "completed-tools-interrupt.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -301,7 +367,7 @@ test "processQueuedPrompt persists completed tool names when cancelled during ne
     try debug_trace.configureForTestWithScopes(alloc, trace_path, "interrupt");
 
     const calls = [_]ToolCall{
-        toolCall("call_list", "list_files", "{\"path\":\".\"}"),
+        toolCall("call_read", "read_file", "{\"path\":\"README.md\"}"),
         toolCall("call_glob", "glob_files", "{\"pattern\":\"*\"}"),
     };
     const completions = [_]FakeCompletion{
@@ -320,7 +386,7 @@ test "processQueuedPrompt persists completed tool names when cancelled during ne
     debug_trace.shutdown();
 
     try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
-    try std.testing.expectEqualStrings("list_files", hooks.executed_names.items[0]);
+    try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
     try std.testing.expectEqualStrings("glob_files", hooks.executed_names.items[1]);
     try std.testing.expectEqual(@as(usize, 1), hooks.interrupted_history_count);
     try std.testing.expectEqual(@as(usize, 1), hooks.interrupted_event_count);
@@ -328,14 +394,14 @@ test "processQueuedPrompt persists completed tool names when cancelled during ne
     try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
     try std.testing.expect(hooks.history_turns.items[0].interrupted.tool_call == null);
     try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items[0].interrupted.completed_tool_names.len);
-    try std.testing.expectEqualStrings("list_files", hooks.history_turns.items[0].interrupted.completed_tool_names[0]);
+    try std.testing.expectEqualStrings("read_file", hooks.history_turns.items[0].interrupted.completed_tool_names[0]);
     try std.testing.expectEqualStrings("glob_files", hooks.history_turns.items[0].interrupted.completed_tool_names[1]);
 
     const trace = try readTraceFile(alloc, trace_path, 65536);
     defer alloc.free(trace);
-    try std.testing.expect(std.mem.find(u8, trace, "active_tool=false completed_tool_count=2 completed_tool_names=list_files,glob_files") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "active_tool=false completed_tool_count=2 completed_tool_names=read_file,glob_files") != null);
 
-    const follow_completions = [_]FakeCompletion{.{ .content = "I ran 2 tools: list_files and glob_files." }};
+    const follow_completions = [_]FakeCompletion{.{ .content = "I ran 2 tools: read_file and glob_files." }};
     var follow_gateway = FakeGateway.init(alloc, &follow_completions);
     defer follow_gateway.deinit();
     var follow_hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -349,7 +415,7 @@ test "processQueuedPrompt persists completed tool names when cancelled during ne
 
     const expected_order = [_][]const u8{
         "use all ur tools 1 by 1 - I need u to test them",
-        "Interrupted by user after completing 2 tool calls: list_files, glob_files.",
+        "Interrupted by user after completing 2 tool calls: read_file, glob_files.",
         "<turn_aborted>",
         "how many did u run up until now ?",
     };
@@ -481,13 +547,33 @@ test "processQueuedPrompt persists interrupted turn with aborted tool output for
     try expectGatewayPromptRoleContentKinds(&follow_gateway, 0);
 }
 
-test "processQueuedPrompt retains cancelled command artifact for presentation only" {
+test "processQueuedPrompt retains cancelled command replay in interrupted history" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "cancelled-command.log" });
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(session_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        session_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "cancelled-command.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -498,8 +584,9 @@ test "processQueuedPrompt retains cancelled command artifact for presentation on
     const artifact_handle = "fx-command-cancelled.log";
     const result_output = "RESULT-ONLY-OUTPUT-SENTINEL\nTERM-TAIL-SENTINEL\n";
     const result_json =
-        "{\"kind\":\"foreground\",\"command\":\"sleep 5\",\"cwd\":\"/tmp/RESULT-JSON-ONLY-SENTINEL\",\"exit_code\":null,\"signal\":15,\"timed_out\":false,\"duration_ms\":7,\"stdout_bytes\":49,\"stderr_bytes\":0,\"truncated\":false,\"output_file\":\"" ++ artifact_path ++ "\",\"stdout_file\":null,\"stderr_file\":null}";
-    const calls = [_]ToolCall{toolCall("call_cancelled_command", "terminal", "{\"action\":\"exec\",\"command\":\"sleep 5\"}")};
+        "{\"kind\":\"command\",\"command\":\"sleep 5\",\"cwd\":\"/tmp/RESULT-JSON-ONLY-SENTINEL\",\"exit_code\":null,\"signal\":15,\"timed_out\":false,\"duration_ms\":7,\"stdout_bytes\":49,\"stderr_bytes\":0,\"truncated\":false,\"output_file\":\"" ++ artifact_path ++ "\",\"stdout_file\":null,\"stderr_file\":null}";
+    const replay_output = "CANCELLED-REPLAY-SENTINEL\n";
+    const calls = [_]ToolCall{toolCall("call_cancelled_command", "terminal", "{\"action\":\"exec\",\"command\":\"sleep 5\",\"timeout_ms\":600000}")};
     const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -512,9 +599,13 @@ test "processQueuedPrompt retains cancelled command artifact for presentation on
         .model_output = result_output,
         .command_result_json = result_json,
     } }};
+    hooks.command_replay_output = replay_output;
+    hooks.command_replay_capability = &capability;
     hooks.cancel_on_execute = &fixture.cancel_flag;
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    var config = fixture.config();
+    config.session_child_capability = &capability;
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
     debug_trace.shutdown();
 
     const trace = try readTraceFile(alloc, trace_path, 65_536);
@@ -543,10 +634,29 @@ test "processQueuedPrompt retains cancelled command artifact for presentation on
     try std.testing.expectEqualStrings("terminal", interrupted_call.name);
     try std.testing.expectEqual(@as(usize, 0), interrupted.completed_tool_names.len);
     try std.testing.expect(interrupted.execution.isEmpty());
-    try std.testing.expect(interrupted.cancelled_command == null);
-
-    const complete_log = try std.fmt.allocPrint(
+    const presentation = interrupted.cancelled_command orelse
+        return error.TestExpectedCancelledCommandPresentation;
+    const descriptor = switch (presentation.output_replay orelse
+        return error.TestExpectedReplay) {
+        .available => |value| value,
+        .unavailable => return error.TestExpectedReplay,
+    };
+    const page = try command_replay_store.readAgentPageManaged(
         alloc,
+        &capability,
+        descriptor.handle,
+        1,
+        4096,
+    );
+    defer alloc.free(page);
+    try std.testing.expect(
+        std.mem.find(u8, page, "CANCELLED-REPLAY-SENTINEL") != null,
+    );
+    var artifacts = try capability.iterate(alloc, .command_artifacts);
+    defer artifacts.deinit();
+    try std.testing.expectEqual(@as(usize, 1), artifacts.names.len);
+
+    const complete_log = try alloc.print(
         "command_output_complete:{d}:call_cancelled_command",
         .{terminal.id.turn_id},
     );
@@ -578,6 +688,11 @@ test "processQueuedPrompt retains cancelled command artifact for presentation on
     try expectBodyNotContains(&follow_gateway, 0, "RESULT-ONLY-OUTPUT-SENTINEL");
     try expectBodyNotContains(&follow_gateway, 0, "RESULT-JSON-ONLY-SENTINEL");
     try expectBodyNotContains(&follow_gateway, 0, "TERM-TAIL-SENTINEL");
+    try expectBodyNotContains(&follow_gateway, 0, replay_output);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, follow_gateway.request_bodies.items[0], descriptor.handle),
+    );
     try expectBodyNotContains(&follow_gateway, 0, artifact_handle);
     try expectBodyNotContains(&follow_gateway, 0, artifact_path);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, follow_gateway.request_bodies.items[0], session_runtime.aborted_tool_output));
@@ -762,7 +877,7 @@ test "processQueuedPrompt trace records partial interrupted projection closures"
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "partial-interrupt-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "partial-interrupt-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

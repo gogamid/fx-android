@@ -1,10 +1,13 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const types = @import("../shared/types.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const compactor = @import("../compactor/compactor.zig");
 const context_limits = @import("context_limits.zig");
+const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
@@ -84,11 +87,14 @@ pub const WorkspaceDirectoryMutation = struct {
     command_line_directories: []const []const u8 = &.{},
 };
 
+pub const ProjectMcpMutation = struct {
+    workspace_root: []const u8,
+    action: project_config.ProjectMcpAction,
+};
+
 pub const UserSettingsPatch = struct {
-    model: ?[]const u8 = null,
+    model_preference: ?ModelPreferencePatch = null,
     provider: ?model_provider.ProviderId = null,
-    codex_model: ?[]const u8 = null,
-    grok_model: ?[]const u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     /// Removes the key entirely so resolution returns to plain precedence.
@@ -97,35 +103,44 @@ pub const UserSettingsPatch = struct {
     yolo_acknowledged: ?bool = null,
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
+    ultrafast_mode: ?bool = null,
     slash_menu_categories: ?bool = null,
+    collapse_tool_calls: ?bool = null,
     update_channel: ?update_target.Channel = null,
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
     statusline_item: ?StatuslineItemPatch = null,
+    session_titles: ?bool = null,
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
 
     fn isEmpty(self: UserSettingsPatch) bool {
-        return self.model == null and
+        return self.model_preference == null and
             self.provider == null and
-            self.codex_model == null and
-            self.grok_model == null and
             self.permission_mode == null and
             self.credential_source == null and
             !self.clear_credential_source and
             self.yolo_acknowledged == null and
             self.effort == null and
             self.fast_mode == null and
+            self.ultrafast_mode == null and
             self.slash_menu_categories == null and
+            self.collapse_tool_calls == null and
             self.update_channel == null and
             self.startup_scrollback == null and
             self.prompt_history_enabled == null and
             self.statusline_item == null and
+            self.session_titles == null and
             self.notification_turn_end == null and
             self.notification_attention_required == null and
             self.notification_max == null;
     }
+};
+
+pub const ModelPreferencePatch = struct {
+    provider: model_provider.ProviderId,
+    model: []const u8,
 };
 
 pub const SettingsScope = enum {
@@ -151,6 +166,7 @@ pub const CommittedSettings = struct {
     scope: SettingsScope,
     cleanup: LegacyCleanup = .{},
     permission_rules_removed: usize = 0,
+    authority_reduced: bool = false,
 };
 
 pub const CommitOutcome = union(enum) {
@@ -191,6 +207,7 @@ const RawPrimary = union(enum) {
 
 const PatchApplication = struct {
     changed: bool = false,
+    authority_reduced: bool = false,
     permission_rules_removed: usize = 0,
     legacy_fields_removed: usize = 0,
     legacy_workspaces_changed: usize = 0,
@@ -202,15 +219,18 @@ const UserPreferenceField = enum(u4) {
     permission_mode,
     effort,
     fast_mode,
+    ultrafast_mode,
     slash_menu_categories,
+    collapse_tool_calls,
     update_channel,
     startup_scrollback,
     prompt_history_enabled,
     statusline_context,
     statusline_session,
+    session_titles,
 
     fn mask(self: UserPreferenceField) u16 {
-        return @as(u16, 1) << @intFromEnum(self);
+        return @as(u16, 1) << @backingInt(self);
     }
 
     fn snapshotName(self: UserPreferenceField) []const u8 {
@@ -219,12 +239,15 @@ const UserPreferenceField = enum(u4) {
             .permission_mode => "settings.json.preference-migration.permission_mode.json",
             .effort => "settings.json.preference-migration.effort.json",
             .fast_mode => "settings.json.preference-migration.fast_mode.json",
+            .ultrafast_mode => "settings.json.preference-migration.ultrafast_mode.json",
             .slash_menu_categories => "settings.json.preference-migration.slash_menu_categories.json",
+            .collapse_tool_calls => "settings.json.preference-migration.collapse_tool_calls.json",
             .update_channel => "settings.json.preference-migration.update_channel.json",
             .startup_scrollback => "settings.json.preference-migration.startup_scrollback.json",
             .prompt_history_enabled => "settings.json.preference-migration.prompt_history_enabled.json",
             .statusline_context => "settings.json.preference-migration.statusline_context.json",
             .statusline_session => "settings.json.preference-migration.statusline_session.json",
+            .session_titles => "settings.json.preference-migration.session_titles.json",
         };
     }
 };
@@ -234,24 +257,29 @@ const user_preference_fields = [_]UserPreferenceField{
     .permission_mode,
     .effort,
     .fast_mode,
+    .ultrafast_mode,
     .slash_menu_categories,
+    .collapse_tool_calls,
     .update_channel,
     .startup_scrollback,
     .prompt_history_enabled,
     .statusline_context,
     .statusline_session,
+    .session_titles,
 };
 
 const SettingsMutation = union(enum) {
     user: UserSettingsPatch,
     workspace_directory: WorkspaceDirectoryMutation,
     permission: PermissionMutation,
+    project_mcp: ProjectMcpMutation,
 
     fn operation(self: SettingsMutation) []const u8 {
         return switch (self) {
             .user => "user_patch",
             .workspace_directory => "workspace_directory_patch",
             .permission => "permission_patch",
+            .project_mcp => "project_mcp_patch",
         };
     }
 
@@ -263,6 +291,7 @@ const SettingsMutation = union(enum) {
                 .user => .user,
                 .local => .local,
             },
+            .project_mcp => .local,
         };
     }
 
@@ -274,6 +303,7 @@ const SettingsMutation = union(enum) {
                 "runtime_first",
             .workspace_directory => "commit_first",
             .permission => "commit_first",
+            .project_mcp => "commit_first",
         };
     }
 
@@ -282,6 +312,7 @@ const SettingsMutation = union(enum) {
             .user => |patch| patch.isEmpty(),
             .workspace_directory => false,
             .permission => false,
+            .project_mcp => false,
         };
     }
 };
@@ -412,6 +443,14 @@ pub const Store = struct {
         return self.applyMutation(alloc, .{ .workspace_directory = mutation });
     }
 
+    pub fn applyProjectMcpMutation(
+        self: *Store,
+        alloc: Allocator,
+        mutation: ProjectMcpMutation,
+    ) !CommitOutcome {
+        return self.applyMutation(alloc, .{ .project_mcp = mutation });
+    }
+
     fn applyMutation(
         self: *Store,
         alloc: Allocator,
@@ -469,7 +508,7 @@ pub const Store = struct {
 
             const original_fingerprint = fingerprintOptional(existing);
             var arena_state = std.heap.ArenaAllocator.init(alloc);
-            defer arena_state.deinit();
+            defer mem_utils.deinit_arena(arena_state);
             const arena = arena_state.allocator();
 
             var root = if (existing) |bytes|
@@ -580,6 +619,7 @@ pub const Store = struct {
                     .recovery_paths = recovery_paths,
                 },
                 .permission_rules_removed = application.permission_rules_removed,
+                .authority_reduced = application.authority_reduced,
             } };
         }
         return error.SettingsConcurrentModification;
@@ -668,7 +708,7 @@ pub const Store = struct {
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch continue;
             defer parsed.deinit();
             if (parsed.value != .object) continue;
-            return try std.fs.path.join(alloc, &.{ self.display_root, profile_paths.backups_dir_name, name });
+            return try std.Io.Dir.path.join(alloc, &.{ self.display_root, profile_paths.backups_dir_name, name });
         }
         return null;
     }
@@ -739,8 +779,7 @@ pub const Store = struct {
         var random_bytes: [16]u8 = undefined;
         io_mod.getIo().random(&random_bytes);
         const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
-        const name = try std.fmt.allocPrint(
-            alloc,
+        const name = try alloc.print(
             "settings.json.{s}.{d}-{x:0>16}-{s}",
             .{ kind, io_mod.milliTimestamp(), sequence, random_hex },
         );
@@ -772,7 +811,7 @@ pub const Store = struct {
             try io_mod.durableReplaceVerified(alloc, &backups, name, bytes);
             try paths.append(
                 alloc,
-                try std.fs.path.join(alloc, &.{ self.display_root, profile_paths.backups_dir_name, name }),
+                try std.Io.Dir.path.join(alloc, &.{ self.display_root, profile_paths.backups_dir_name, name }),
             );
         }
         return paths.toOwnedSlice(alloc);
@@ -789,8 +828,8 @@ fn failStoreParentSync(_: ?*anyopaque, _: std.Io.Dir) anyerror!void {
 }
 
 fn validateWorkspaceRoot(workspace_root: []const u8) !void {
-    if (workspace_root.len == 0 or workspace_root.len > std.fs.max_path_bytes) return error.InvalidDurableField;
-    if (!std.fs.path.isAbsolute(workspace_root) or !std.unicode.utf8ValidateSlice(workspace_root)) {
+    if (workspace_root.len == 0 or workspace_root.len > std.Io.Dir.max_path_bytes) return error.InvalidDurableField;
+    if (!std.Io.Dir.path.isAbsolute(workspace_root) or !std.unicode.utf8ValidateSlice(workspace_root)) {
         return error.InvalidDurableField;
     }
 }
@@ -835,6 +874,20 @@ fn validateMutation(mutation: SettingsMutation) !void {
                 try validateWorkspaceRoot(workspace_root);
             },
         },
+        .project_mcp => |project_mcp| {
+            try validateWorkspaceRoot(project_mcp.workspace_root);
+            switch (project_mcp.action) {
+                .approve, .reject => |name| {
+                    if (name.len == 0 or name.len > 1024 or
+                        !std.unicode.utf8ValidateSlice(name) or
+                        std.mem.findScalar(u8, name, 0) != null)
+                    {
+                        return error.InvalidDurableField;
+                    }
+                },
+                .approve_all, .reset => {},
+            }
+        },
     }
 }
 
@@ -848,13 +901,28 @@ pub fn validateModel(model: []const u8) !void {
     }
 }
 
+/// Bounds on the gateway provider routing list (`provider_order`). Slugs are
+/// the gateway's provider identifiers (for example `anthropic`, `bedrock`,
+/// `vertexAnthropic`; case matters).
+pub const max_provider_order_entries: usize = 8;
+pub const max_provider_slug_bytes: usize = 64;
+
+pub fn validateProviderSlug(slug: []const u8) bool {
+    if (slug.len == 0 or slug.len > max_provider_slug_bytes) return false;
+    if (!std.ascii.isAlphanumeric(slug[0])) return false;
+    for (slug) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-') return false;
+    }
+    return true;
+}
+
 fn validateUserPatch(patch: UserSettingsPatch) !void {
-    if (patch.model) |model| try validateModel(model);
+    if (patch.model_preference) |preference| try validateModel(preference.model);
 }
 
 fn validAdditionalDirectoryPath(path: []const u8) bool {
-    return path.len > 0 and path.len <= std.fs.max_path_bytes and
-        std.fs.path.isAbsolute(path) and std.unicode.utf8ValidateSlice(path) and
+    return path.len > 0 and path.len <= std.Io.Dir.max_path_bytes and
+        std.Io.Dir.path.isAbsolute(path) and std.unicode.utf8ValidateSlice(path) and
         std.mem.findScalar(u8, path, 0) == null;
 }
 
@@ -878,7 +946,33 @@ test "clearing the credential choice removes the key rather than blanking it" {
     try std.testing.expect(!application.changed);
 }
 
-test "provider patch keeps independent provider models" {
+test "ultrafast user patch writes a profile-owned bool" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), "{}", .{});
+    defer parsed.deinit();
+    var root = parsed.value;
+
+    const application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .ultrafast_mode = false });
+    try std.testing.expect(application.changed);
+    try std.testing.expect(!root.object.get("ultrafast_mode").?.bool);
+}
+
+test "collapse tool calls user patch writes the profile preference" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), "{}", .{});
+    defer parsed.deinit();
+    var root = parsed.value;
+
+    const application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .collapse_tool_calls = true });
+    try std.testing.expect(application.changed);
+    try std.testing.expect(root.object.get("collapse_tool_calls").?.bool);
+}
+
+test "provider patch writes one bounded provider model collection" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -891,15 +985,39 @@ test "provider patch keeps independent provider models" {
     );
     const application = try applyUserPatchToRoot(arena.allocator(), &root, .{
         .provider = .codex,
-        .codex_model = "gpt-5.4-mini",
-        .grok_model = "grok-4.20-0309-non-reasoning",
+        .model_preference = .{ .provider = .codex, .model = "gpt-5.4-mini" },
     });
     try std.testing.expect(application.changed);
     try std.testing.expectEqualStrings("gateway/model", root.object.get("model").?.string);
     try std.testing.expectEqualStrings("codex", root.object.get("provider").?.string);
-    try std.testing.expectEqualStrings("gpt-5.4-mini", root.object.get("codex_model").?.string);
-    try std.testing.expectEqualStrings("grok-4.20-0309-non-reasoning", root.object.get("grok_model").?.string);
+    try std.testing.expectEqualStrings("gpt-5.4-mini", root.object.get("models").?.object.get("codex").?.string);
+    try std.testing.expect(!root.object.contains("codex_model"));
     try std.testing.expectEqual(model_provider.ProviderId.codex, model_provider.parse(root.object.get("provider").?.string).?);
+}
+
+test "model and fast patch binds the fast preference atomically" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    var root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        "{\"models\":{\"gateway\":\"provider/old\"},\"fast_mode\":true}",
+        .{},
+    );
+    _ = try applyUserPatchToRoot(arena.allocator(), &root, .{
+        .model_preference = .{ .provider = .gateway, .model = "provider/fast-toggle" },
+        .fast_mode = true,
+    });
+    const binding = root.object.get("fast_mode_model_bound");
+    try std.testing.expect(binding != null);
+    try std.testing.expect(binding.?.bool);
+
+    _ = try applyUserPatchToRoot(arena.allocator(), &root, .{
+        .model_preference = .{ .provider = .gateway, .model = "provider/default" },
+    });
+    try std.testing.expect(!root.object.contains("fast_mode_model_bound"));
 }
 
 fn applyMutationToRoot(
@@ -916,6 +1034,7 @@ fn applyMutationToRoot(
             workspace,
         ),
         .permission => |permission| applyPermissionMutationToRoot(arena, root, permission),
+        .project_mcp => |project_mcp| applyProjectMcpMutationToRoot(arena, root, project_mcp),
     };
     application.changed = application.changed or retired_settings_removed;
     return application;
@@ -927,10 +1046,10 @@ fn applyUserPatchToRoot(
     patch: UserSettingsPatch,
 ) !PatchApplication {
     var application = PatchApplication{};
-    if (patch.model) |value| application.changed = try putString(arena, &root.object, "model", value) or application.changed;
-    if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", @tagName(value)) or application.changed;
-    if (patch.codex_model) |value| application.changed = try putString(arena, &root.object, "codex_model", value) or application.changed;
-    if (patch.grok_model) |value| application.changed = try putString(arena, &root.object, "grok_model", value) or application.changed;
+    if (patch.model_preference) |preference| {
+        application.changed = try putModelPreference(arena, &root.object, preference) or application.changed;
+    }
+    if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", value.label()) or application.changed;
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", @tagName(value)) or application.changed;
     if (patch.credential_source) |value| application.changed = try putString(arena, &root.object, "credential_source", @tagName(value)) or application.changed;
     if (patch.clear_credential_source and root.object.contains("credential_source")) {
@@ -940,9 +1059,18 @@ fn applyUserPatchToRoot(
     if (patch.yolo_acknowledged) |value| application.changed = try putBool(arena, &root.object, "yolo_acknowledged", value) or application.changed;
     if (patch.effort) |value| application.changed = try putString(arena, &root.object, "effort", value.label()) or application.changed;
     if (patch.fast_mode) |value| application.changed = try putBool(arena, &root.object, "fast_mode", value) or application.changed;
+    if (patch.ultrafast_mode) |value| application.changed = try putBool(arena, &root.object, "ultrafast_mode", value) or application.changed;
+    if (patch.model_preference != null and patch.fast_mode != null) {
+        application.changed = try putBool(arena, &root.object, "fast_mode_model_bound", true) or application.changed;
+    } else if ((patch.model_preference != null or patch.fast_mode != null) and root.object.contains("fast_mode_model_bound")) {
+        _ = root.object.orderedRemove("fast_mode_model_bound");
+        application.changed = true;
+    }
     if (patch.slash_menu_categories) |value| application.changed = try putBool(arena, &root.object, "slash_menu_categories", value) or application.changed;
+    if (patch.collapse_tool_calls) |value| application.changed = try putBool(arena, &root.object, "collapse_tool_calls", value) or application.changed;
     if (patch.update_channel) |value| application.changed = try putString(arena, &root.object, "update_channel", value.label()) or application.changed;
     if (patch.startup_scrollback) |value| application.changed = try putBool(arena, &root.object, "startup_scrollback", value) or application.changed;
+    if (patch.session_titles) |value| application.changed = try putBool(arena, &root.object, "session_titles", value) or application.changed;
 
     if (patch.prompt_history_enabled) |enabled| {
         var prompt_history = if (root.object.getPtr("prompt_history")) |value| blk: {
@@ -1035,7 +1163,7 @@ fn cleanupLegacyWorkspacePreferences(
             &entry.value_ptr.object,
             "model",
             .model,
-            patch.model != null,
+            patch.model_preference != null and patch.model_preference.?.provider == .gateway,
             application,
         );
         removeLegacyLeaf(
@@ -1061,9 +1189,29 @@ fn cleanupLegacyWorkspacePreferences(
         );
         removeLegacyLeaf(
             &entry.value_ptr.object,
+            "ultrafast_mode",
+            .ultrafast_mode,
+            patch.ultrafast_mode != null,
+            application,
+        );
+        if ((patch.model_preference != null or patch.fast_mode != null) and
+            entry.value_ptr.object.contains("fast_mode_model_bound"))
+        {
+            _ = entry.value_ptr.object.orderedRemove("fast_mode_model_bound");
+            application.legacy_fields_removed += 1;
+        }
+        removeLegacyLeaf(
+            &entry.value_ptr.object,
             "slash_menu_categories",
             .slash_menu_categories,
             patch.slash_menu_categories != null,
+            application,
+        );
+        removeLegacyLeaf(
+            &entry.value_ptr.object,
+            "collapse_tool_calls",
+            .collapse_tool_calls,
+            patch.collapse_tool_calls != null,
             application,
         );
         removeLegacyLeaf(
@@ -1078,6 +1226,13 @@ fn cleanupLegacyWorkspacePreferences(
             "startup_scrollback",
             .startup_scrollback,
             patch.startup_scrollback != null,
+            application,
+        );
+        removeLegacyLeaf(
+            &entry.value_ptr.object,
+            "session_titles",
+            .session_titles,
+            patch.session_titles != null,
             application,
         );
         removeLegacyNestedLeaf(
@@ -1360,6 +1515,59 @@ fn applyPermissionMutationToRoot(
     return applyPermissionPatch(arena, target, mutation.patch);
 }
 
+fn applyProjectMcpMutationToRoot(
+    arena: Allocator,
+    root: *std.json.Value,
+    mutation: ProjectMcpMutation,
+) !PatchApplication {
+    const existing_workspace = if (root.object.get("workspaces")) |workspaces|
+        if (workspaces == .object) workspaces.object.get(mutation.workspace_root) else null
+    else
+        null;
+    var diagnostics: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(arena);
+        diagnostics.deinit(arena);
+    }
+    var current = try project_config.parseChoices(arena, existing_workspace, &diagnostics);
+    defer current.deinit(arena);
+    var transition = try project_config.applyAction(arena, current, mutation.action);
+    defer transition.choices.deinit(arena);
+
+    const workspace = try workspaceObject(arena, root, mutation.workspace_root);
+    var changed = false;
+    if (transition.choices.approved.len == 0) {
+        changed = workspace.orderedRemove(project_config.enabled_servers_key) or changed;
+    } else {
+        changed = try putStringArray(
+            arena,
+            workspace,
+            project_config.enabled_servers_key,
+            transition.choices.approved,
+        ) or changed;
+    }
+    if (transition.choices.rejected.len == 0) {
+        changed = workspace.orderedRemove(project_config.disabled_servers_key) or changed;
+    } else {
+        changed = try putStringArray(
+            arena,
+            workspace,
+            project_config.disabled_servers_key,
+            transition.choices.rejected,
+        ) or changed;
+    }
+    if (transition.choices.enable_all) {
+        changed = try putBool(arena, workspace, project_config.enable_all_key, true) or changed;
+    } else {
+        changed = workspace.orderedRemove(project_config.enable_all_key) or changed;
+    }
+    removeWorkspaceIfEmpty(root, mutation.workspace_root);
+    return .{
+        .changed = changed,
+        .authority_reduced = transition.authority_reduced,
+    };
+}
+
 fn workspaceObject(
     arena: Allocator,
     root: *std.json.Value,
@@ -1389,6 +1597,82 @@ fn putString(arena: Allocator, object: *std.json.ObjectMap, key: []const u8, val
     }
     try object.put(arena, key, .{ .string = try arena.dupe(u8, value) });
     return true;
+}
+
+fn putStringArray(
+    arena: Allocator,
+    object: *std.json.ObjectMap,
+    key: []const u8,
+    values: []const []const u8,
+) !bool {
+    if (object.get(key)) |existing| {
+        if (existing == .array and existing.array.items.len == values.len) {
+            var equal = true;
+            for (existing.array.items, values) |field, value| {
+                if (field != .string or !std.mem.eql(u8, field.string, value)) {
+                    equal = false;
+                    break;
+                }
+            }
+            if (equal) return false;
+        }
+    }
+    var array = std.json.Array.init(arena);
+    try array.ensureTotalCapacity(values.len);
+    for (values) |value| array.appendAssumeCapacity(.{ .string = try arena.dupe(u8, value) });
+    try object.put(arena, key, .{ .array = array });
+    return true;
+}
+
+fn putModelPreference(
+    arena: Allocator,
+    root: *std.json.ObjectMap,
+    preference: ModelPreferencePatch,
+) !bool {
+    try validateModel(preference.model);
+    var changed = false;
+    const models = if (root.getPtr("models")) |value| blk: {
+        if (value.* != .object) return error.InvalidSettingsFormat;
+        break :blk &value.object;
+    } else blk: {
+        try root.put(arena, "models", .{ .object = .empty });
+        changed = true;
+        break :blk &root.getPtr("models").?.object;
+    };
+    const provider_key = if (preference.provider == .configured) try arena.dupe(u8, preference.provider.label()) else preference.provider.label();
+    changed = try putString(arena, models, provider_key, preference.model) or changed;
+    const legacy_key = switch (preference.provider) {
+        .gateway => "model",
+        .codex => "codex_model",
+        .grok => "grok_model",
+        .configured => return changed,
+    };
+    if (root.contains(legacy_key)) {
+        _ = root.orderedRemove(legacy_key);
+        changed = true;
+    }
+    return changed;
+}
+
+test "configured model preference keys survive their producer frame" {
+    const Producer = struct {
+        noinline fn insert(arena: Allocator, root: *std.json.ObjectMap) !void {
+            _ = try putModelPreference(arena, root, .{ .provider = model_provider.parse("workspace-only-connection").?, .model = "opaque-model" });
+        }
+        noinline fn overwrite_stack() void {
+            var buffer: [8192]u8 = @splat(0xa5);
+            std.mem.doNotOptimizeAway(&buffer);
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var root: std.json.ObjectMap = .empty;
+    try Producer.insert(arena.allocator(), &root);
+    Producer.overwrite_stack();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try std.json.Stringify.value(std.json.Value{ .object = root }, .{}, &output.writer);
+    try std.testing.expectEqualStrings("{\"models\":{\"workspace-only-connection\":\"opaque-model\"}}", output.written());
 }
 
 fn putBool(arena: Allocator, object: *std.json.ObjectMap, key: []const u8, value: bool) !bool {
@@ -1580,9 +1864,11 @@ fn validateCandidate(
             .user => return,
             .local => permission.workspace_root.?,
         },
+        .project_mcp => |project_mcp| project_mcp.workspace_root,
     };
     const workspace_may_be_absent = switch (mutation) {
         .workspace_directory => |workspace| workspace.patch != .add,
+        .project_mcp => |project_mcp| project_mcp.action == .reset,
         else => false,
     };
     const workspaces = parsed.value.object.get("workspaces") orelse {
@@ -1596,6 +1882,16 @@ fn validateCandidate(
     };
     if (workspace != .object) return error.InvalidSettingsFormat;
     try validateKnownSettingsObject(workspace.object, true);
+    if (mutation == .project_mcp) {
+        var diagnostics: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(alloc);
+            diagnostics.deinit(alloc);
+        }
+        var choices = project_config.parseChoices(alloc, workspace, &diagnostics) catch
+            return error.InvalidSettingsFormat;
+        choices.deinit(alloc);
+    }
 }
 
 fn validateKnownSettingsObject(
@@ -1619,14 +1915,27 @@ fn validateKnownSettingsObject(
         if (value != .string) return error.InvalidSettingsFormat;
         try validateModel(value.string);
     }
+    if (object.get("models")) |value| {
+        if (value != .object) return error.InvalidSettingsFormat;
+        var iterator = value.object.iterator();
+        while (iterator.next()) |entry| {
+            const provider = model_provider.parse(entry.key_ptr.*) orelse
+                return error.InvalidSettingsFormat;
+            if (!std.mem.eql(u8, entry.key_ptr.*, provider.label()) or
+                entry.value_ptr.* != .string)
+            {
+                return error.InvalidSettingsFormat;
+            }
+            try validateModel(entry.value_ptr.string);
+        }
+    }
     if (object.get("permission_mode")) |value| {
-        if (value != .string or
-            (!std.ascii.eqlIgnoreCase(value.string, "ask") and
-                !std.ascii.eqlIgnoreCase(value.string, "auto") and
-                !std.ascii.eqlIgnoreCase(value.string, "yolo")))
-        {
+        if (value != .string or types.PermissionMode.parse(value.string) == null) {
             return error.InvalidSettingsFormat;
         }
+    }
+    if (object.get("theme")) |value| {
+        if (value != .string) return error.InvalidSettingsFormat;
     }
     if (object.get("credential_source")) |value| {
         if (value != .string or types.parseCredentialSource(value.string) == null) {
@@ -1641,13 +1950,32 @@ fn validateKnownSettingsObject(
             return error.InvalidSettingsFormat;
         }
     }
+    if (object.get("auto_compact_percent")) |value| {
+        if (value != .integer or value.integer < 0 or !compactor.isValidPercent(@intCast(value.integer))) {
+            return error.InvalidSettingsFormat;
+        }
+    }
     if (object.get("skill_match_fuzzy")) |value| {
         if (value != .bool) return error.InvalidSettingsFormat;
     }
     if (object.get("context_limits")) |value| {
         _ = context_limits.parseJsonObject(value) catch return error.InvalidSettingsFormat;
     }
-    inline for (&.{ "context", "fast_mode", "auto_upgrade", "slash_menu_categories", "startup_scrollback", "yolo_acknowledged" }) |key| {
+    if (object.get("provider_order")) |value| {
+        // An empty array explicitly clears an inherited routing list.
+        if (value != .array or value.array.items.len > max_provider_order_entries) {
+            return error.InvalidSettingsFormat;
+        }
+        for (value.array.items, 0..) |item, index| {
+            if (item != .string or !validateProviderSlug(item.string)) return error.InvalidSettingsFormat;
+            for (value.array.items[0..index]) |previous| {
+                if (previous == .string and std.mem.eql(u8, item.string, previous.string)) {
+                    return error.InvalidSettingsFormat;
+                }
+            }
+        }
+    }
+    inline for (&.{ "context", "fast_mode", "ultrafast_mode", "auto_upgrade", "slash_menu_categories", "startup_scrollback", "yolo_acknowledged", "provider_strict" }) |key| {
         if (object.get(key)) |value| {
             if (value != .bool) return error.InvalidSettingsFormat;
         }
@@ -1722,7 +2050,7 @@ fn parseSequence(name: []const u8) ?u64 {
     {
         return null;
     }
-    const first_dash = std.mem.indexOfScalar(u8, name, '-') orelse return null;
+    const first_dash = std.mem.findScalar(u8, name, '-') orelse return null;
     const sequence_start = first_dash + 1;
     if (sequence_start + 16 >= name.len or name[sequence_start + 16] != '-') return null;
     return std.fmt.parseInt(u64, name[sequence_start .. sequence_start + 16], 16) catch null;
@@ -1741,7 +2069,7 @@ fn parseBackupTimestamp(name: []const u8) ?i64 {
         }
     }
     const text = suffix orelse return null;
-    const end = std.mem.indexOfScalar(u8, text, '-') orelse text.len;
+    const end = std.mem.findScalar(u8, text, '-') orelse text.len;
     if (end == 0) return null;
     return std.fmt.parseInt(i64, text[0..end], 10) catch null;
 }
@@ -1779,7 +2107,7 @@ fn containsCopyWithFingerprint(
     bytes: []const u8,
 ) !bool {
     const expected = fingerprintOptional(bytes);
-    const prefix = try std.fmt.allocPrint(alloc, "settings.json.{s}.", .{kind});
+    const prefix = try alloc.print("settings.json.{s}.", .{kind});
     defer alloc.free(prefix);
     var iterator = dir.iterate();
     while (try iterator.next(io_mod.getIo())) |entry| {
@@ -1806,7 +2134,7 @@ fn pruneSequencedCopies(
     kind: []const u8,
     keep_count: usize,
 ) !void {
-    const prefix = try std.fmt.allocPrint(alloc, "settings.json.{s}.", .{kind});
+    const prefix = try alloc.print("settings.json.{s}.", .{kind});
     defer alloc.free(prefix);
     var names: std.ArrayList([]u8) = .empty;
     defer {
@@ -1843,6 +2171,29 @@ fn writeStoreFixture(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !v
     try file.writeStreamingAll(io_mod.getIo(), text);
 }
 
+test "user patch accepts existing full access aliases and preserves their spelling" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "full-access", "Full Access", "yolo" }) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+        const original = try alloc.print("{{\"permission_mode\":\"{s}\"}}\n", .{mode});
+        defer alloc.free(original);
+        try writeStoreFixture(tmp.dir, "home/.fx/settings.json", original);
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+        defer alloc.free(home);
+        var store = try Store.initFromHome(alloc, home, .writable);
+        defer store.deinit(alloc);
+        var outcome = try store.applyUserPatch(alloc, .{ .yolo_acknowledged = true });
+        defer outcome.deinit(alloc);
+        try std.testing.expect(outcome == .committed);
+        const bytes = try store.readPrimaryForTest(alloc);
+        defer alloc.free(bytes);
+        try std.testing.expect(std.mem.find(u8, bytes, mode) != null);
+        try std.testing.expect(std.mem.find(u8, bytes, "\"yolo_acknowledged\":true") != null);
+    }
+}
+
 test "user patch writes user preferences at top level" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1856,7 +2207,7 @@ test "user patch writes user preferences at top level" {
     defer store.deinit(alloc);
 
     var outcome = try store.applyUserPatch(alloc, .{
-        .model = "openai/gpt-5.4",
+        .model_preference = .{ .provider = .gateway, .model = "openai/gpt-5.4" },
         .permission_mode = .yolo,
         .yolo_acknowledged = true,
         .effort = types.ReasoningEffort.literal("high"),
@@ -1877,7 +2228,7 @@ test "user patch writes user preferences at top level" {
 
     const bytes = try store.readPrimaryForTest(alloc);
     defer alloc.free(bytes);
-    try std.testing.expect(std.mem.find(u8, bytes, "\"model\":\"openai/gpt-5.4\"") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"models\":{\"gateway\":\"openai/gpt-5.4\"}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"permission_mode\":\"yolo\"") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"yolo_acknowledged\":true") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"effort\":\"high\"") != null);
@@ -1908,7 +2259,7 @@ test "user patch retires presentation settings without rejecting their values" {
     var store = try Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
 
-    var outcome = try store.applyUserPatch(alloc, .{ .model = "openai/gpt-5.4" });
+    var outcome = try store.applyUserPatch(alloc, .{ .model_preference = .{ .provider = .gateway, .model = "openai/gpt-5.4" } });
     defer outcome.deinit(alloc);
     try std.testing.expect(outcome == .committed);
 
@@ -2043,7 +2394,7 @@ test "user patch snapshots and removes legacy workspace copies" {
     defer store.deinit(alloc);
 
     var outcome = try store.applyUserPatch(alloc, .{
-        .model = "openai/gpt-5.4",
+        .model_preference = .{ .provider = .gateway, .model = "openai/gpt-5.4" },
         .permission_mode = .auto,
     });
     defer outcome.deinit(alloc);
@@ -2055,7 +2406,7 @@ test "user patch snapshots and removes legacy workspace copies" {
 
     const bytes = try store.readPrimaryForTest(alloc);
     defer alloc.free(bytes);
-    try std.testing.expect(std.mem.find(u8, bytes, "\"model\":\"openai/gpt-5.4\"") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"models\":{\"gateway\":\"openai/gpt-5.4\"}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"permission_mode\":\"auto\"") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "input_appearance") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"model\":\"workspace/a\"") == null);
@@ -2158,7 +2509,7 @@ test "later migration refreshes the bounded field recovery snapshot" {
     var store = try Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
 
-    var first = try store.applyUserPatch(alloc, .{ .model = "user/one" });
+    var first = try store.applyUserPatch(alloc, .{ .model_preference = .{ .provider = .gateway, .model = "user/one" } });
     defer first.deinit(alloc);
     const first_path = try alloc.dupe(
         u8,
@@ -2169,7 +2520,7 @@ test "later migration refreshes the bounded field recovery snapshot" {
     const second_original =
         "{\"model\":\"user/one\",\"workspaces\":{\"/workspace/b\":{\"model\":\"legacy/two\"}}}\n";
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", second_original);
-    var second = try store.applyUserPatch(alloc, .{ .model = "user/two" });
+    var second = try store.applyUserPatch(alloc, .{ .model_preference = .{ .provider = .gateway, .model = "user/two" } });
     defer second.deinit(alloc);
 
     try std.testing.expect(std.mem.eql(
@@ -2260,7 +2611,7 @@ test "migration snapshot failure leaves primary byte identical" {
 
     try std.testing.expectError(
         error.SettingsMigrationSnapshotFailed,
-        store.applyUserPatch(alloc, .{ .model = "openai/gpt-5.4" }),
+        store.applyUserPatch(alloc, .{ .model_preference = .{ .provider = .gateway, .model = "openai/gpt-5.4" } }),
     );
 
     const bytes = try store.readPrimaryForTest(alloc);
@@ -2363,7 +2714,7 @@ test "oversized migration candidate fails before creating recovery snapshot" {
 
     try std.testing.expectError(
         error.SettingsTooLarge,
-        store.applyUserPatch(alloc, .{ .model = model }),
+        store.applyUserPatch(alloc, .{ .model_preference = .{ .provider = .gateway, .model = model } }),
     );
     const bytes = try store.readPrimaryForTest(alloc);
     defer alloc.free(bytes);
@@ -2382,8 +2733,7 @@ test "user permission mutation preserves local rules" {
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const fixture = try std.fmt.allocPrint(
-        alloc,
+    const fixture = try alloc.print(
         "{{\"permission\":{{\"bash\":{{\"global *\":\"allow\"}}}},\"workspaces\":{{\"{s}\":{{\"permission\":{{\"bash\":{{\"local *\":\"allow\"}}}}}}}}}}\n",
         .{workspace},
     );
@@ -2423,8 +2773,7 @@ test "permission mutation validates scope paths and isolates remove and reset" {
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const fixture = try std.fmt.allocPrint(
-        alloc,
+    const fixture = try alloc.print(
         "{{\"permission\":{{\"bash\":{{\"user *\":\"allow\"}}}},\"workspaces\":{{\"{s}\":{{\"permission\":{{\"bash\":{{\"local *\":\"allow\",\"deny *\":\"deny\"}},\"read\":{{\"*\":\"allow\"}}}}}}}}}}\n",
         .{workspace},
     );
@@ -2575,7 +2924,7 @@ test "user patch traces metadata without settings content" {
     defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const trace_path = try std.fs.path.join(alloc, &.{ home, "settings-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ home, "settings-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -2585,7 +2934,7 @@ test "user patch traces metadata without settings content" {
     var store = try Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
     var outcome = try store.applyUserPatch(alloc, .{
-        .model = "FX_MODEL_SECRET",
+        .model_preference = .{ .provider = .gateway, .model = "FX_MODEL_SECRET" },
         .fast_mode = true,
     });
     defer outcome.deinit(alloc);
@@ -2653,7 +3002,7 @@ test "multi-value user patch commits model effort and fast mode once" {
     defer store.deinit(alloc);
 
     var outcome = try store.applyUserPatch(alloc, .{
-        .model = "openai/gpt-5.4",
+        .model_preference = .{ .provider = .gateway, .model = "openai/gpt-5.4" },
         .effort = types.ReasoningEffort.literal("high"),
         .fast_mode = false,
     });
@@ -2738,7 +3087,7 @@ test "oversized candidate leaves prior primary unchanged" {
     @memset(oversized_model, 'm');
     try std.testing.expectError(
         error.InvalidDurableField,
-        store.applyUserPatch(alloc, .{ .model = oversized_model }),
+        store.applyUserPatch(alloc, .{ .model_preference = .{ .provider = .gateway, .model = oversized_model } }),
     );
     const primary = try store.readPrimaryForTest(alloc);
     defer alloc.free(primary);
@@ -2774,7 +3123,7 @@ test "startup scrollback user patch removes matching legacy workspace value" {
     defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const fixture = try std.fmt.allocPrint(alloc, "{{\"startup_scrollback\":true,\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}\n", .{workspace});
+    const fixture = try alloc.print("{{\"startup_scrollback\":true,\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}\n", .{workspace});
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
     var store = try Store.initFromHome(alloc, home, .writable);
@@ -2797,8 +3146,7 @@ test "unrelated user patch preserves inert output level values" {
     defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const fixture = try std.fmt.allocPrint(
-        alloc,
+    const fixture = try alloc.print(
         "{{\"output_level\":{{\"legacy\":true}},\"workspaces\":{{\"{s}\":{{\"output_level\":[\"quiet\",7],\"future\":true}}}}}}\n",
         .{workspace},
     );
@@ -2998,6 +3346,86 @@ test "post-rename failure returns SettingsCommitIndeterminate" {
     );
 }
 
+test "project MCP mutation writes exact workspace keys and classifies reduction" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var approved = try store.applyProjectMcpMutation(alloc, .{
+        .workspace_root = workspace,
+        .action = .{ .approve = "docs" },
+    });
+    defer approved.deinit(alloc);
+    try std.testing.expect(approved == .committed);
+    try std.testing.expect(!approved.committed.authority_reduced);
+
+    var rejected = try store.applyProjectMcpMutation(alloc, .{
+        .workspace_root = workspace,
+        .action = .{ .reject = "docs" },
+    });
+    defer rejected.deinit(alloc);
+    try std.testing.expect(rejected == .committed);
+    try std.testing.expect(rejected.committed.authority_reduced);
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, project_config.disabled_servers_key) != null);
+    try std.testing.expect(std.mem.find(u8, bytes, project_config.enabled_servers_key) == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "projectMcp") == null);
+
+    var reset = try store.applyProjectMcpMutation(alloc, .{
+        .workspace_root = workspace,
+        .action = .reset,
+    });
+    defer reset.deinit(alloc);
+    try std.testing.expect(reset == .committed);
+    try std.testing.expect(!reset.committed.authority_reduced);
+    const reset_bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(reset_bytes);
+    try std.testing.expect(std.mem.find(u8, reset_bytes, project_config.enabled_servers_key) == null);
+    try std.testing.expect(std.mem.find(u8, reset_bytes, project_config.disabled_servers_key) == null);
+    try std.testing.expect(std.mem.find(u8, reset_bytes, project_config.enable_all_key) == null);
+}
+
+test "indeterminate project MCP rejection may expose reduced settings" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+    var approved = try store.applyProjectMcpMutation(alloc, .{
+        .workspace_root = workspace,
+        .action = .{ .approve = "docs" },
+    });
+    approved.deinit(alloc);
+    store.failParentSyncAfterRenameForTest();
+
+    try std.testing.expectError(
+        error.SettingsCommitIndeterminate,
+        store.applyProjectMcpMutation(alloc, .{
+            .workspace_root = workspace,
+            .action = .{ .reject = "docs" },
+        }),
+    );
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, project_config.disabled_servers_key) != null);
+    try std.testing.expect(std.mem.find(u8, bytes, project_config.enabled_servers_key) == null);
+}
+
 test "indeterminate migration retains recovery metadata for the caller" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3014,7 +3442,7 @@ test "indeterminate migration retains recovery metadata for the caller" {
 
     try std.testing.expectError(
         error.SettingsCommitIndeterminate,
-        store.applyUserPatch(alloc, .{ .model = "user/model" }),
+        store.applyUserPatch(alloc, .{ .model_preference = .{ .provider = .gateway, .model = "user/model" } }),
     );
     var cleanup = store.takeFailureCleanup();
     defer cleanup.deinit(alloc);
@@ -3051,7 +3479,7 @@ test "read-only settings load under missing home is absent without creating stat
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const home = try std.fs.path.join(alloc, &.{ root, "missing-home" });
+    const home = try std.Io.Dir.path.join(alloc, &.{ root, "missing-home" });
     defer alloc.free(home);
 
     var store = try Store.initFromHome(alloc, home, .read_only);
@@ -3181,12 +3609,11 @@ test "workspace directory mutations use workspace access path identity" {
     defer alloc.free(primary);
     const shared = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "shared");
     defer alloc.free(shared);
-    const shared_dot = try std.fmt.allocPrint(alloc, "{s}{c}.", .{ shared, std.fs.path.sep });
+    const shared_dot = try alloc.print("{s}{c}.", .{ shared, std.Io.Dir.path.sep });
     defer alloc.free(shared_dot);
-    const shared_link = try std.fs.path.resolve(alloc, &.{ primary, "../shared-link" });
+    const shared_link = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../shared-link" });
     defer alloc.free(shared_link);
-    const available_fixture = try std.fmt.allocPrint(
-        alloc,
+    const available_fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
         .{ primary, shared_dot, shared_link },
     );
@@ -3222,18 +3649,16 @@ test "workspace directory mutations use workspace access path identity" {
     defer alloc.free(available_removed);
     try std.testing.expect(std.mem.find(u8, available_removed, "additional_directories") == null);
 
-    const missing = try std.fs.path.resolve(alloc, &.{ primary, "../missing" });
+    const missing = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../missing" });
     defer alloc.free(missing);
-    const missing_dot = try std.fmt.allocPrint(alloc, "{s}{c}.", .{ missing, std.fs.path.sep });
+    const missing_dot = try alloc.print("{s}{c}.", .{ missing, std.Io.Dir.path.sep });
     defer alloc.free(missing_dot);
-    const missing_parent = try std.fmt.allocPrint(
-        alloc,
+    const missing_parent = try alloc.print(
         "{s}{c}child{c}..",
-        .{ missing, std.fs.path.sep, std.fs.path.sep },
+        .{ missing, std.Io.Dir.path.sep, std.Io.Dir.path.sep },
     );
     defer alloc.free(missing_parent);
-    const unavailable_fixture = try std.fmt.allocPrint(
-        alloc,
+    const unavailable_fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
         .{ primary, missing_dot, missing_parent },
     );
@@ -3275,9 +3700,9 @@ test "workspace directory removal uses observed sources and preserves unseen con
     defer alloc.free(primary);
     const first = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "first");
     defer alloc.free(first);
-    const observed_source = try std.fs.path.resolve(alloc, &.{ primary, "../observed-link" });
+    const observed_source = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../observed-link" });
     defer alloc.free(observed_source);
-    const unseen_source = try std.fs.path.resolve(alloc, &.{ primary, "../unseen-link" });
+    const unseen_source = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../unseen-link" });
     defer alloc.free(unseen_source);
     const observed_sources = [_]workspace_access.SavedSource{.{
         .source = observed_source,
@@ -3288,8 +3713,7 @@ test "workspace directory removal uses observed sources and preserves unseen con
     try tmp.dir.symLink(std.testing.io, "second", "observed-link", .{ .is_directory = true });
     try tmp.dir.symLink(std.testing.io, "first", "unseen-link", .{ .is_directory = true });
 
-    const fixture = try std.fmt.allocPrint(
-        alloc,
+    const fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
         .{ primary, observed_source, unseen_source },
     );
@@ -3341,16 +3765,15 @@ test "workspace directory removal stabilizes observed survivor identity" {
     defer alloc.free(removed);
     const survivor = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "survivor");
     defer alloc.free(survivor);
-    const removed_source = try std.fs.path.resolve(alloc, &.{ primary, "../removed-link" });
+    const removed_source = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../removed-link" });
     defer alloc.free(removed_source);
-    const survivor_source = try std.fs.path.resolve(alloc, &.{ primary, "../survivor-link" });
+    const survivor_source = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../survivor-link" });
     defer alloc.free(survivor_source);
     const observed_sources = [_]workspace_access.SavedSource{
         .{ .source = removed_source, .identity = removed },
         .{ .source = survivor_source, .identity = survivor },
     };
-    const fixture = try std.fmt.allocPrint(
-        alloc,
+    const fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
         .{ primary, removed_source, survivor_source },
     );
@@ -3529,7 +3952,7 @@ test "workspace directory add counts an unseen command line root once" {
         .get("additional_directories").?.array.items;
     try std.testing.expectEqual(workspace_access.max_additional_directories, directories.len);
     for (directories[0 .. directories.len - 1], 0..) |directory, index| {
-        const expected = try std.fmt.allocPrint(alloc, "/unseen-{d}", .{index});
+        const expected = try alloc.print("/unseen-{d}", .{index});
         defer alloc.free(expected);
         try std.testing.expectEqualStrings(expected, directory.string);
     }
@@ -3555,14 +3978,13 @@ test "workspace directory existing add stabilizes a retargeted observed source" 
     defer alloc.free(primary);
     const first = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "first");
     defer alloc.free(first);
-    const source = try std.fs.path.resolve(alloc, &.{ primary, "../saved-link" });
+    const source = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../saved-link" });
     defer alloc.free(source);
     const observed_sources = [_]workspace_access.SavedSource{.{
         .source = source,
         .identity = first,
     }};
-    const fixture = try std.fmt.allocPrint(
-        alloc,
+    const fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\"]}}}}}}\n",
         .{ primary, source },
     );
@@ -3618,13 +4040,13 @@ test "workspace directory capacity compaction uses observed source identities" {
     var initialized: usize = 0;
     defer for (aliases[0..initialized]) |path| alloc.free(path);
     for (&aliases, &observed, 0..) |*alias, *source, index| {
-        const name = try std.fmt.allocPrint(alloc, "stable-link-{d}", .{index});
+        const name = try alloc.print("stable-link-{d}", .{index});
         defer alloc.free(name);
         tmp.dir.symLink(std.testing.io, "shared", name, .{ .is_directory = true }) catch |err| switch (err) {
             error.AccessDenied => return error.SkipZigTest,
             else => return err,
         };
-        alias.* = try std.fs.path.resolve(alloc, &.{ primary, "..", name });
+        alias.* = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "..", name });
         source.* = .{ .source = alias.*, .identity = shared };
         initialized += 1;
     }
@@ -3690,13 +4112,13 @@ test "workspace directory add compacts saved aliases before applying effective c
     var initialized: usize = 0;
     defer for (aliases[0..initialized]) |path| alloc.free(path);
     for (&aliases, &observed, 0..) |*alias, *source, index| {
-        const name = try std.fmt.allocPrint(alloc, "shared-link-{d}", .{index});
+        const name = try alloc.print("shared-link-{d}", .{index});
         defer alloc.free(name);
         tmp.dir.symLink(std.testing.io, "shared", name, .{ .is_directory = true }) catch |err| switch (err) {
             error.AccessDenied => return error.SkipZigTest,
             else => return err,
         };
-        alias.* = try std.fs.path.resolve(alloc, &.{ primary, "..", name });
+        alias.* = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "..", name });
         source.* = .{ .source = alias.*, .identity = shared };
         initialized += 1;
     }

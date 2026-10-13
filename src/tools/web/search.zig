@@ -19,8 +19,6 @@ pub const readsOnly = search_args.readsOnly;
 pub const isIrreversible = search_args.isIrreversible;
 
 pub const Source = web_search_contract.Source;
-pub const SearchBlock = web_search_contract.SearchBlock;
-pub const TerminalIncomplete = web_search_contract.TerminalIncomplete;
 pub const ResultItem = web_search_contract.ResultItem;
 pub const Output = web_search_contract.Output;
 
@@ -177,7 +175,7 @@ fn testToolSpec() tool_dispatch.Tool {
     return .{
         .name = "web_search",
         .description = "Web search test spec.",
-        .gateway_schema = .{
+        .model_schema = .{
             .name = "web_search",
             .description = "Web search test spec.",
         },

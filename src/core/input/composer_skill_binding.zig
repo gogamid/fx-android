@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const composer_insertion = @import("composer_insertion.zig");
 const edit_history = @import("edit_history.zig");
 const editor_state = @import("editor_state.zig");
@@ -36,7 +37,7 @@ pub const State = struct {
         self.insertion.history.reset(alloc);
         self.insertion.vertical_navigation.reset();
         self.insertion.picker.reconcileInlinePickerAfterEdit(self.insertion.edit);
-        self.insertion.picker.resetActiveModelPickerIndex();
+        self.insertion.picker.resetActiveCompletionIndex();
         self.insertion.input_limit_rejection.* = input_limit_rejection.clear();
     }
 };
@@ -196,14 +197,14 @@ fn checkAllocationFailureIsAtomic(
 }
 
 test "composer skill binding is atomic across allocation failures" {
-    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     var allocation_count: usize = 0;
     try checkAllocationFailureIsAtomic(&probe, null, &allocation_count);
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..allocation_count) |fail_offset| {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{},
         );
         var ignored_count: usize = 0;

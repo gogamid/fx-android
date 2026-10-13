@@ -1,4 +1,8 @@
 const std = @import("std");
+const io_mod = @import("../shared/io.zig");
+
+pub const mcp_add_usage = "mcp add slack | mcp add NAME COMMAND [ARGS...] | mcp add --transport http NAME URL";
+pub const mcp_auth_usage = "mcp auth NAME";
 const display_width = @import("../shared/display_width.zig");
 const list_window = @import("../shared/list_window.zig");
 const mod_registry = @import("../mods/registry.zig");
@@ -16,10 +20,11 @@ pub const TopLevelKind = enum {
     setup,
     status,
     permissions,
+    mcp,
+    slack,
     models,
     provider,
     doctor,
-    background,
     teams,
     session,
     sessions,
@@ -37,21 +42,15 @@ pub const SlashKind = enum {
     new_session,
     reset_session,
     resume_session,
-    continue_recovery,
     rename_session,
     help,
     login,
     logout,
-    setup,
+    provider,
     status,
-    background,
-    background_stop,
-    background_open,
-    background_logs,
     image,
     images,
     model,
-    models,
     permissions,
     allowlist,
     stats,
@@ -68,9 +67,11 @@ pub const SlashKind = enum {
     credits,
     paste,
     fast,
+    ultrafast,
     statusline,
     notifications,
     workspace,
+    shell,
     version,
 };
 
@@ -181,7 +182,7 @@ pub fn childChatSlashRegistry(
     var count: usize = 0;
     for (registry.commands) |spec| {
         switch (spec.kind) {
-            .quit, .models, .skills => {
+            .quit, .model, .skills => {
                 std.debug.assert(count < storage.len);
                 storage[count] = spec;
                 count += 1;
@@ -194,6 +195,7 @@ pub fn childChatSlashRegistry(
 
 pub const HelpMenu = struct {
     active: bool = false,
+    category: ?SlashPresentationCategory = null,
     selected_index: usize = 0,
     window_start: usize = 0,
 
@@ -210,8 +212,26 @@ pub const HelpMenu = struct {
         self.window_start = 0;
     }
 
+    pub fn cycleCategory(self: *HelpMenu, delta: i32) bool {
+        if (!self.active or delta == 0) return false;
+        const count: i32 = @intCast(@typeInfo(SlashPresentationCategory).@"enum".field_names.len + 1);
+        var next: i32 = if (self.category) |category|
+            @as(i32, @intCast(@backingInt(category))) + 1
+        else
+            0;
+        next += delta;
+        while (next < 0) next += count;
+        while (next >= count) next -= count;
+        self.category = if (next == 0)
+            null
+        else
+            @fromBackingInt(@intCast(next - 1));
+        self.resetForQuery();
+        return true;
+    }
+
     pub fn move(self: *HelpMenu, registry: SlashRegistry, query: []const u8, delta: i32, visible_items: u16) bool {
-        const item_count = helpCatalogCount(registry, query);
+        const item_count = helpCatalogCountForCategory(registry, self.category, query);
         if (!self.active or item_count == 0) return false;
 
         const current: i32 = @intCast(self.selected_index % item_count);
@@ -229,9 +249,9 @@ pub const HelpMenu = struct {
     }
 
     pub fn selectedSpec(self: *const HelpMenu, registry: SlashRegistry, query: []const u8) ?*const SlashSpec {
-        const item_count = helpCatalogCount(registry, query);
+        const item_count = helpCatalogCountForCategory(registry, self.category, query);
         if (!self.active or item_count == 0) return null;
-        return helpCatalogSpecAt(registry, query, self.selected_index % item_count);
+        return helpCatalogSpecAtForCategory(registry, self.category, query, self.selected_index % item_count);
     }
 };
 
@@ -387,6 +407,17 @@ pub fn helpCatalogCount(registry: SlashRegistry, query: []const u8) usize {
     return count;
 }
 
+pub fn helpCatalogCountForCategory(
+    registry: SlashRegistry,
+    category: ?SlashPresentationCategory,
+    query: []const u8,
+) usize {
+    return if (category) |value|
+        helpCatalogCategoryCount(registry, query, value)
+    else
+        helpCatalogCount(registry, query);
+}
+
 pub fn helpCatalogCategoryCount(registry: SlashRegistry, query: []const u8, category: SlashPresentationCategory) usize {
     var count: usize = 0;
     for (registry.commands) |spec| {
@@ -404,6 +435,22 @@ pub fn helpCatalogSpecAt(registry: SlashRegistry, query: []const u8, display_ind
             if (current == display_index) return spec;
             current += 1;
         }
+    }
+    return null;
+}
+
+pub fn helpCatalogSpecAtForCategory(
+    registry: SlashRegistry,
+    category: ?SlashPresentationCategory,
+    query: []const u8,
+    display_index: usize,
+) ?*const SlashSpec {
+    const value = category orelse return helpCatalogSpecAt(registry, query, display_index);
+    var current: usize = 0;
+    for (registry.commands) |*spec| {
+        if (spec.presentation_category != value or !helpCatalogSpecMatches(spec.*, query)) continue;
+        if (current == display_index) return spec;
+        current += 1;
     }
     return null;
 }
@@ -523,13 +570,20 @@ pub fn slashCompletionPrefix(registry: SlashRegistry, input: []const u8) ?[]cons
     const prefix = std.mem.trimStart(u8, input, " \t\r\n");
     if (prefix.len == 0 or prefix[0] != '/') return null;
 
-    const command_end = std.mem.indexOfAny(u8, prefix, " \t\r\n") orelse return prefix;
+    const command_end = std.mem.findAny(u8, prefix, " \t\r\n") orelse return prefix;
     const spec = registry.lookup(prefix[0..command_end]) orelse return prefix;
     if (!spec.has_args) return null;
     return prefix;
 }
 
 pub fn slashCompletionCount(registry: SlashRegistry, prefix: []const u8) usize {
+    if (runtimeArgQuery(registry, prefix)) |query| {
+        var count: usize = 0;
+        for (registry.arguments) |entry| {
+            if (runtimeArgMatches(registry, entry.full, query)) count += 1;
+        }
+        return count;
+    }
     if (allowlistArgCompletionPrefix(prefix)) |query| {
         return allowlistArgCompletionCount(query);
     }
@@ -555,6 +609,9 @@ pub fn slashCompletionCount(registry: SlashRegistry, prefix: []const u8) usize {
 }
 
 pub fn nthSlashCompletion(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
+    if (runtimeArgQuery(registry, prefix)) |query| {
+        return (nthRuntimeArg(registry, query, n) orelse return null).full;
+    }
     if (allowlistArgCompletionPrefix(prefix)) |query| {
         return nthAllowlistArgCompletion(query, n);
     }
@@ -578,6 +635,7 @@ pub fn nthSlashCompletion(registry: SlashRegistry, prefix: []const u8, n: usize)
 /// known arg-completion commands. Returns 0 when
 /// the prefix is not an arg-completion command.
 pub fn argCompletionAnchor(prefix: []const u8) usize {
+    if (mcpVerbsOn() and argCompletionPrefix(prefix, "/mcp") != null) return "/mcp ".len;
     if (statuslineArgCompletionPrefix(prefix) != null) return "/statusline ".len;
     if (notificationsArgCompletionPrefix(prefix) != null) return "/sound ".len;
     if (permissionsArgCompletionPrefix(prefix) != null) return "/permissions ".len;
@@ -591,6 +649,10 @@ pub fn argCompletionAnchor(prefix: []const u8) usize {
 /// shows only the argument. For everything else the
 /// full command string is returned unchanged.
 pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
+    if (runtimeArgQuery(registry, prefix)) |query| {
+        const entry = nthRuntimeArg(registry, query, n) orelse return null;
+        return entry.full[runtimeArgCommand(registry).len + 1 ..];
+    }
     if (allowlistArgCompletionPrefix(prefix)) |query| {
         return nthAllowlistArgLabel(query, n);
     }
@@ -610,6 +672,9 @@ pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: u
 }
 
 pub fn nthSlashCompletionDescription(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
+    if (runtimeArgQuery(registry, prefix)) |query| {
+        return (nthRuntimeArg(registry, query, n) orelse return null).description;
+    }
     if (allowlistArgCompletionPrefix(prefix) != null) return null;
     if (statuslineArgCompletionPrefix(prefix) != null) return null;
     if (notificationsArgCompletionPrefix(prefix) != null) return null;
@@ -700,7 +765,7 @@ const permissions_arg_completions = [_][]const u8{
     "/permissions auto",
     "/permissions remember",
     "/permissions revoke",
-    "/permissions yolo",
+    "/permissions full-access",
     "/permissions reset",
 };
 
@@ -758,13 +823,8 @@ const allowlist_add_tool_completions = [_][]const u8{
     "/allowlist add tool read_file",
     "/allowlist add tool write_file",
     "/allowlist add tool edit_file",
-    "/allowlist add tool list_files",
     "/allowlist add tool glob_files",
     "/allowlist add tool grep_files",
-    "/allowlist add tool open_file",
-    "/allowlist add tool create_folder",
-    "/allowlist add tool rename_file",
-    "/allowlist add tool copy_file",
     "/allowlist add tool skill",
     "/allowlist add tool install_skill",
     "/allowlist add tool subagent",
@@ -774,13 +834,8 @@ const allowlist_remove_tool_completions = [_][]const u8{
     "/allowlist remove tool read_file",
     "/allowlist remove tool write_file",
     "/allowlist remove tool edit_file",
-    "/allowlist remove tool list_files",
     "/allowlist remove tool glob_files",
     "/allowlist remove tool grep_files",
-    "/allowlist remove tool open_file",
-    "/allowlist remove tool create_folder",
-    "/allowlist remove tool rename_file",
-    "/allowlist remove tool copy_file",
     "/allowlist remove tool skill",
     "/allowlist remove tool install_skill",
     "/allowlist remove tool subagent",
@@ -813,6 +868,46 @@ const allowlist_local_add_tool_completions = scopedAllowlistCompletions("local",
 const allowlist_user_add_tool_completions = scopedAllowlistCompletions("user", allowlist_add_tool_completions);
 const allowlist_local_remove_tool_completions = scopedAllowlistCompletions("local", allowlist_remove_tool_completions);
 const allowlist_user_remove_tool_completions = scopedAllowlistCompletions("user", allowlist_remove_tool_completions);
+
+/// MCP-v2's `/mcp` completes its verbs and server names. The
+/// check goes with FX_MCP_ENGINE when v1 is removed.
+fn mcpVerbsOn() bool {
+    const value = io_mod.getenv("FX_MCP_ENGINE") orelse return false;
+    return std.mem.eql(u8, value, "v2");
+}
+
+fn runtimeArgCommand(registry: SlashRegistry) []const u8 {
+    const first = registry.arguments[0].full;
+    return first[0 .. std.mem.findScalar(u8, first, ' ') orelse first.len];
+}
+
+/// What follows the command the app's completions are for, untrimmed at
+/// the end so a finished word moves on to the next one.
+fn runtimeArgQuery(registry: SlashRegistry, prefix: []const u8) ?[]const u8 {
+    if (registry.arguments.len == 0) return null;
+    const command = runtimeArgCommand(registry);
+    if (!std.mem.startsWith(u8, prefix, command) or prefix.len == command.len) return null;
+    if (prefix[command.len] != ' ') return null;
+    return std.mem.trimStart(u8, prefix[command.len..], " ");
+}
+
+/// A verb matches before its first space, and `VERB NAME` after it.
+fn runtimeArgMatches(registry: SlashRegistry, full: []const u8, query: []const u8) bool {
+    const rest = full[runtimeArgCommand(registry).len + 1 ..];
+    const naming = std.mem.findScalar(u8, query, ' ') != null;
+    if (naming != (std.mem.findScalar(u8, rest, ' ') != null)) return false;
+    return std.ascii.startsWithIgnoreCase(rest, query);
+}
+
+fn nthRuntimeArg(registry: SlashRegistry, query: []const u8, n: usize) ?mod_registry.ArgumentCompletion {
+    var idx: usize = 0;
+    for (registry.arguments) |entry| {
+        if (!runtimeArgMatches(registry, entry.full, query)) continue;
+        if (idx == n) return entry;
+        idx += 1;
+    }
+    return null;
+}
 
 fn argCompletionPrefix(prefix: []const u8, command: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, prefix, command)) return null;
@@ -934,39 +1029,6 @@ fn nthAllowlistArgLabel(query: []const u8, n: usize) ?[]const u8 {
     const state = allowlistArgCompletionState(query);
     const full = nthArgCompletion(state.completions, state.label_offset, state.query, n) orelse return null;
     return full[state.label_offset..];
-}
-
-/// Returns the index of `label` among the matching arg completions for
-/// the given prefix, or null if the label is not in the filtered set.
-pub fn argCompletionIndexForLabel(prefix: []const u8, label: []const u8) ?usize {
-    if (allowlistArgCompletionPrefix(prefix)) |query| {
-        const state = allowlistArgCompletionState(query);
-        return indexOfArgLabel(state.completions, state.label_offset, state.query, label);
-    }
-    if (statuslineArgCompletionPrefix(prefix)) |query| {
-        return indexOfArgLabel(&statusline_arg_completions, "/statusline ".len, query, label);
-    }
-    if (notificationsArgCompletionPrefix(prefix)) |query| {
-        return indexOfArgLabel(&notifications_arg_completions, "/sound ".len, query, label);
-    }
-    if (permissionsArgCompletionPrefix(prefix)) |query| {
-        return indexOfArgLabel(&permissions_arg_completions, "/permissions ".len, query, label);
-    }
-    if (workspaceArgCompletionPrefix(prefix)) |query| {
-        return indexOfArgLabel(&workspace_arg_completions, "/workspace ".len, query, label);
-    }
-    return null;
-}
-
-fn indexOfArgLabel(completions: []const []const u8, command_with_space_len: usize, query: []const u8, label: []const u8) ?usize {
-    var idx: usize = 0;
-    for (completions) |completion| {
-        if (!argCompletionMatches(completion, command_with_space_len, query)) continue;
-        const arg = completion[command_with_space_len..];
-        if (std.mem.eql(u8, arg, label)) return idx;
-        idx += 1;
-    }
-    return null;
 }
 
 fn argCompletionMatches(completion: []const u8, command_with_space_len: usize, query: []const u8) bool {
@@ -1317,8 +1379,8 @@ fn writeTopLevelHelpEntry(writer: *std.Io.Writer, registry: TopLevelRegistry, en
     const padding = usage_width - entry.usage.len + 2;
     var prefix_buf: [128]u8 = undefined;
     var continuation_buf: [96]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&prefix_buf, "  {s}{s}{s}{s}", .{ styleStart(style, .syntax), entry.usage, styleEnd(style), spaces[0..padding] });
-    const continuation = try std.fmt.bufPrint(&continuation_buf, "  {s}", .{spaces[0 .. usage_width + 2]});
+    const prefix = try std.mem.print(&prefix_buf, "  {s}{s}{s}{s}", .{ styleStart(style, .syntax), entry.usage, styleEnd(style), spaces[0..padding] });
+    const continuation = try std.mem.print(&continuation_buf, "  {s}", .{spaces[0 .. usage_width + 2]});
     try writeWrappedLine(writer, prefix, continuation, summary, columns);
 }
 
@@ -1327,8 +1389,8 @@ fn writeTopLevelFlag(writer: *std.Io.Writer, flag: TopLevelFlag, usage_width: us
     const padding = usage_width - flag.usage.len + 2;
     var prefix_buf: [160]u8 = undefined;
     var continuation_buf: [96]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&prefix_buf, "  {s}{s}{s}{s}", .{ styleStart(style, .syntax), flag.usage, styleEnd(style), spaces[0..padding] });
-    const continuation = try std.fmt.bufPrint(&continuation_buf, "  {s}", .{spaces[0 .. usage_width + 2]});
+    const prefix = try std.mem.print(&prefix_buf, "  {s}{s}{s}{s}", .{ styleStart(style, .syntax), flag.usage, styleEnd(style), spaces[0..padding] });
+    const continuation = try std.mem.print(&continuation_buf, "  {s}", .{spaces[0 .. usage_width + 2]});
     try writeWrappedLine(writer, prefix, continuation, flag.description, columns);
 }
 
@@ -1342,7 +1404,7 @@ fn writeTopLevelResource(writer: *std.Io.Writer, resource: TopLevelResource, lab
     const spaces = "                                                                ";
     const padding = label_width - display_width.visibleWidth(resource.label) + 2;
     var prefix_buf: [128]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&prefix_buf, "{s}{s}{s}{s}", .{ styleStart(style, .label), resource.label, styleEnd(style), spaces[0..padding] });
+    const prefix = try std.mem.print(&prefix_buf, "{s}{s}{s}{s}", .{ styleStart(style, .label), resource.label, styleEnd(style), spaces[0..padding] });
     const value_role: HelpRole = if (resource.link) .link else .syntax;
     try writeWrappedStyledLine(writer, prefix, "  ", resource.value, columns, style, value_role);
 }
@@ -1547,14 +1609,21 @@ test "rendered top-level help is a complete CLI navigation page" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.startsWith(u8, text, "𝒇x v9.8.7\nFast, native coding agent for the terminal."));
-    try std.testing.expect(std.mem.find(u8, text, "𝒇x starts an interactive session by default.") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "𝒇x"));
+    try std.testing.expect(std.mem.find(u8, text, "fx starts an interactive session by default.") != null);
     try std.testing.expect(std.mem.find(u8, text, "fx <command> [...flags] [...args]") != null);
     try std.testing.expect(std.mem.find(u8, text, "Commands:") != null);
     try std.testing.expect(std.mem.find(u8, text, "ask <prompt>") != null);
     try std.testing.expect(std.mem.find(u8, text, "Run one noninteractive request") != null);
     try std.testing.expect(std.mem.find(u8, text, "Draft or publish a GitHub issue") != null);
     try std.testing.expect(std.mem.find(u8, text, "credits|balance") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Show the AI Gateway credit balance") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Sign in to a model provider") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Sign out of a model provider") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Choose the active model provider") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Configure a Vercel AI Gateway API key") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Choose a Vercel AI Gateway team") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Show Vercel AI Gateway credits") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Sign in to Vercel or a selected provider") == null);
     try std.testing.expect(std.mem.find(u8, text, "Flags:") != null);
     try std.testing.expect(std.mem.find(u8, text, "--context-limit <spec>") != null);
     try std.testing.expect(std.mem.find(u8, text, "Set name=bytes|off; repeatable") != null);
@@ -1574,15 +1643,25 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "fx session resume last") != null);
     try std.testing.expect(std.mem.find(u8, text, "session resume [last|id]") != null);
     try std.testing.expect(std.mem.find(u8, text, "fx status --json") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Run `fx <command> --help` for command-specific usage and options.") != null);
+    try std.testing.expect(std.mem.find(u8, text, "command-specific options and examples") == null);
     try std.testing.expect(std.mem.find(u8, text, "Run `/help` inside an interactive session for slash commands.") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Learn more about 𝒇x:  https://fx.sh/docs") != null);
-    try std.testing.expect(std.mem.find(u8, text, "\nReport a problem:     run `/feedback` inside 𝒇x\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Learn more about fx:  https://fx.sh/docs") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\nReport a problem:     run `/feedback` inside fx\n") != null);
     try std.testing.expect(std.mem.find(u8, text, "\n\n\nRun `fx <command> --help`") == null);
     try std.testing.expect(std.mem.find(u8, text, "Start:") == null);
     try std.testing.expect(std.mem.find(u8, text, "  Work      ") == null);
     try std.testing.expect(std.mem.find(u8, text, "More:") == null);
     try std.testing.expect(std.mem.find(u8, text, "resume [last|<id>] [--record]") == null);
     try std.testing.expect(std.mem.find(u8, text, "session migrate <id>|--id <id>") == null);
+}
+
+test "top-level help summary overrides do not change command-specific help" {
+    const login = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .login);
+    defer std.testing.allocator.free(login);
+
+    try std.testing.expect(std.mem.find(u8, login, "Sign in to Vercel or a selected provider") != null);
+    try std.testing.expect(std.mem.find(u8, login, "Sign in to a model provider") == null);
 }
 
 test "terminal top-level help adds styling without changing visible content" {
@@ -1599,7 +1678,7 @@ test "terminal top-level help adds styling without changing visible content" {
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mask <prompt>\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;243mFast, native coding agent") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[4mhttps://fx.sh/docs\x1b[0m") != null);
-    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mrun `/feedback` inside 𝒇x\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mrun `/feedback` inside fx\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;252m") == null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;245m") == null);
     try std.testing.expectEqualStrings(plain, stripped);
@@ -1611,25 +1690,28 @@ test "top-level help renders flags as compact aligned rows" {
     const narrow = try renderTopLevelHelp(std.testing.allocator, testTopLevelRegistry(), 60, "9.8.7");
     defer std.testing.allocator.free(narrow);
 
-    try std.testing.expect(lineContainsBoth(wide, "--record", "Record terminal output"));
     try std.testing.expect(lineContainsBoth(wide, "--context-limit <spec>", "Set name=bytes|off; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--add-dir <path>", "Add a workspace directory; repeatable"));
-    try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the latest workspace session"));
+    try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the remembered workspace session"));
     try std.testing.expect(lineContainsBoth(wide, "-r", "Open the saved-session picker"));
     try std.testing.expect(lineContainsBoth(wide, "--resume [last|<id>]", "Resume the latest workspace session or an exact ID"));
     try std.testing.expect(lineContainsBoth(wide, "--resume-last", "Resume the latest workspace session"));
-    try std.testing.expect(std.mem.find(u8, wide, "Record terminal output\n\n  --context-limit") == null);
-    try std.testing.expect(std.mem.find(u8, wide, "Print the 𝒇x version and exit\n\nExamples:") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "Print the fx version and exit\n\nExamples:") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "List available models\n\n  setup") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "Show Vercel AI Gateway credits\n\n  usage") != null);
     try expectAllLinesFit(narrow, 60);
+}
 
-    var lines = std.mem.splitScalar(u8, wide, '\n');
-    while (lines.next()) |line| {
-        const description_start = std.mem.find(u8, line, "Record terminal output") orelse continue;
-        try std.testing.expect(display_width.visibleWidth(line[0..description_start]) <= 28);
-        break;
-    } else {
-        return error.TestExpectedEqual;
-    }
+test "top-level help hides developer recording surfaces" {
+    const text = try renderTopLevelHelp(std.testing.allocator, testTopLevelRegistry(), 120, "9.8.7");
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.find(u8, text, "--record") == null);
+    try std.testing.expect(std.mem.find(u8, text, "replay <tape>") == null);
+
+    const replay = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .replay);
+    defer std.testing.allocator.free(replay);
+    try std.testing.expect(std.mem.find(u8, replay, "fx replay") != null);
 }
 
 test "default top-level help styles fit the startup buffer" {
@@ -1653,13 +1735,13 @@ test "per-command help renders header usage options and details" {
     try std.testing.expect(std.mem.find(u8, text, "Modes:") != null);
 }
 
-test "per-command help preserves long resume usage outside top-level index" {
+test "per-command help preserves long resume usage without debug recording" {
     const text = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .@"resume");
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx session resume [last|<id>] [--record] | session resume --id <id> [--record] | --resume [last|<id>] [--record] | resume [last|<id>] [--record] | resume --id <id> [--record] | --resume-last | --continue | -c | -r | --resume-<id>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>") != null);
     try std.testing.expect(std.mem.find(u8, text, "Options:") != null);
-    try std.testing.expect(std.mem.find(u8, text, "--record") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--record") == null);
 }
 
 test "ACP help documents accepted options" {
@@ -1667,7 +1749,7 @@ test "ACP help documents accepted options" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.find(u8, text, "fx acp\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx acp [--model <id>] [--log-file <path>]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]") != null);
     try std.testing.expect(std.mem.find(u8, text, "--model <id>") != null);
     try std.testing.expect(std.mem.find(u8, text, "--log-file <path>") != null);
 }
@@ -1700,20 +1782,17 @@ test "slash completion matches prefix and aliases" {
 
 test "slash completion ranks exact prefix and substring command matches" {
     const specs = [_]SlashSpec{
-        .{ .kind = .models, .command = "/models", .help_entry = "/models", .completion_description = "browse models", .presentation_category = .model },
         .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename session", .presentation_category = .session },
         .{ .kind = .model, .command = "/model", .help_entry = "/model <id>", .completion_description = "choose model", .presentation_category = .model },
     };
     const registry = SlashRegistry{ .commands = specs[0..] };
 
-    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(registry, "/model"));
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(registry, "/model"));
     try std.testing.expectEqualStrings("/model", nthSlashCompletion(registry, "/model", 0).?);
     try std.testing.expectEqualStrings("choose model", nthSlashCompletionDescription(registry, "/model", 0).?);
-    try std.testing.expectEqualStrings("/models", nthSlashCompletion(registry, "/model", 1).?);
 
-    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(registry, "/mo"));
-    try std.testing.expectEqualStrings("/models", nthSlashCompletion(registry, "/mo", 0).?);
-    try std.testing.expectEqualStrings("/model", nthSlashCompletion(registry, "/mo", 1).?);
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(registry, "/mo"));
+    try std.testing.expectEqualStrings("/model", nthSlashCompletion(registry, "/mo", 0).?);
 
     try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(registry, "/name"));
     try std.testing.expectEqualStrings("/rename", nthSlashCompletion(registry, "/name", 0).?);
@@ -1748,7 +1827,7 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 37), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 36), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
@@ -1792,30 +1871,30 @@ test "rendered slash summaries include aliases and welcome entries" {
 
 test "top-level specs cover every TopLevelKind" {
     const registry = testTopLevelRegistry();
-    var seen = [_]bool{false} ** std.meta.fields(TopLevelKind).len;
+    var seen: [@typeInfo(TopLevelKind).@"enum".field_names.len]bool = @splat(false);
     for (registry.specs) |spec| {
-        const index = @intFromEnum(spec.kind);
+        const index = @backingInt(spec.kind);
         try std.testing.expect(!seen[index]);
         seen[index] = true;
     }
-    inline for (std.meta.fields(TopLevelKind)) |field| {
-        const kind: TopLevelKind = @enumFromInt(field.value);
-        try std.testing.expect(seen[@intFromEnum(kind)]);
+    inline for (@typeInfo(TopLevelKind).@"enum".field_values) |field_value| {
+        const kind: TopLevelKind = @fromBackingInt(@intCast(field_value));
+        try std.testing.expect(seen[@backingInt(kind)]);
         try std.testing.expect(topLevelUsage(registry, kind).len > 0);
     }
 }
 
 test "slash specs cover every SlashKind" {
-    var seen = [_]bool{false} ** std.meta.fields(SlashKind).len;
+    var seen: [@typeInfo(SlashKind).@"enum".field_names.len]bool = @splat(false);
     const registry = testSlashRegistry();
     for (registry.commands) |spec| {
-        const index = @intFromEnum(spec.kind);
+        const index = @backingInt(spec.kind);
         try std.testing.expect(!seen[index]);
         seen[index] = true;
     }
-    inline for (std.meta.fields(SlashKind)) |field| {
-        const kind: SlashKind = @enumFromInt(field.value);
-        try std.testing.expect(seen[@intFromEnum(kind)]);
+    inline for (@typeInfo(SlashKind).@"enum".field_values) |field_value| {
+        const kind: SlashKind = @fromBackingInt(@intCast(field_value));
+        try std.testing.expect(seen[@backingInt(kind)]);
         _ = slashSpec(registry, kind);
     }
 }
@@ -1826,9 +1905,16 @@ test "child chat slash registry exposes only locally handled commands" {
 
     try std.testing.expectEqual(@as(usize, 3), child.commands.len);
     try std.testing.expect(matchesSlashExact(child, "/quit", .quit));
-    try std.testing.expect(matchesSlashExact(child, "/models", .models));
+    try std.testing.expect(matchesSlashExact(child, "/model", .model));
+    try std.testing.expect(child.matchExact("/models") == null);
     try std.testing.expect(matchesSlashExact(child, "/skills", .skills));
     try std.testing.expect(child.matchExact("/help") == null);
+}
+
+test "interactive model command has no plural spelling" {
+    const registry = testSlashRegistry();
+    try std.testing.expect(registry.matchExact("/model") != null);
+    try std.testing.expect(registry.matchExact("/models") == null);
 }
 
 test "default slash registry resolves primary commands and aliases" {
@@ -1894,14 +1980,6 @@ test "slash completion prefix yields to no-argument command submission" {
     try std.testing.expect(slashCompletionPrefix(registry, "/resume ") == null);
     try std.testing.expect(slashCompletionPrefix(registry, "\n\t/resume\nignored") == null);
     try std.testing.expect(slashCompletionPrefix(registry, "/exit\t") == null);
-}
-
-test "slash completions skip hidden subcommands" {
-    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/background"));
-    try std.testing.expectEqualStrings("/background", nthSlashCompletion(testSlashRegistry(), "/background", 0).?);
-    try std.testing.expect(nthSlashCompletion(testSlashRegistry(), "/background", 1) == null);
-    try std.testing.expectEqual(@as(usize, 0), slashCompletionCount(testSlashRegistry(), "/background s"));
-    try std.testing.expect(nthSlashCompletion(testSlashRegistry(), "/background s", 0) == null);
 }
 
 test "slash completions include allowlist staged arguments" {
@@ -2025,15 +2103,15 @@ test "slash completions list permission modes and rule management" {
     try std.testing.expectEqualStrings("/permissions auto", nthSlashCompletion(testSlashRegistry(), "/permissions ", 1).?);
     try std.testing.expectEqualStrings("/permissions remember", nthSlashCompletion(testSlashRegistry(), "/permissions ", 2).?);
     try std.testing.expectEqualStrings("/permissions revoke", nthSlashCompletion(testSlashRegistry(), "/permissions ", 3).?);
-    try std.testing.expectEqualStrings("/permissions yolo", nthSlashCompletion(testSlashRegistry(), "/permissions ", 4).?);
+    try std.testing.expectEqualStrings("/permissions full-access", nthSlashCompletion(testSlashRegistry(), "/permissions ", 4).?);
     try std.testing.expectEqualStrings("/permissions reset", nthSlashCompletion(testSlashRegistry(), "/permissions ", 5).?);
     try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(testSlashRegistry(), "/permissions a"));
     try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/permissions as"));
     try std.testing.expectEqualStrings("/permissions ask", nthSlashCompletion(testSlashRegistry(), "/permissions as", 0).?);
     try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/permissions au"));
     try std.testing.expectEqualStrings("/permissions auto", nthSlashCompletion(testSlashRegistry(), "/permissions au", 0).?);
-    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/permissions y"));
-    try std.testing.expectEqualStrings("/permissions yolo", nthSlashCompletion(testSlashRegistry(), "/permissions y", 0).?);
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/permissions f"));
+    try std.testing.expectEqualStrings("/permissions full-access", nthSlashCompletion(testSlashRegistry(), "/permissions f", 0).?);
     try std.testing.expectEqual(@as(usize, 3), slashCompletionCount(testSlashRegistry(), "/permissions r"));
     try std.testing.expectEqualStrings("/permissions remember", nthSlashCompletion(testSlashRegistry(), "/permissions r", 0).?);
     try std.testing.expectEqualStrings("/permissions revoke", nthSlashCompletion(testSlashRegistry(), "/permissions r", 1).?);
@@ -2046,7 +2124,7 @@ test "slash completion labels strip argument prefixes" {
     try std.testing.expectEqualStrings("auto", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 1).?);
     try std.testing.expectEqualStrings("remember", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 2).?);
     try std.testing.expectEqualStrings("revoke", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 3).?);
-    try std.testing.expectEqualStrings("yolo", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 4).?);
+    try std.testing.expectEqualStrings("full-access", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 4).?);
     try std.testing.expectEqualStrings("reset", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 5).?);
     try std.testing.expectEqualStrings("view", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist ", 0).?);
     try std.testing.expectEqualStrings("add", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist ", 1).?);
@@ -2059,25 +2137,23 @@ test "slash completion labels strip argument prefixes" {
 }
 
 test "slash completion descriptions follow completion matches" {
-    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(testSlashRegistry(), "/mo"));
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/mo"));
     try std.testing.expectEqualStrings("/model", nthSlashCompletion(testSlashRegistry(), "/mo", 0).?);
     try std.testing.expectEqualStrings("choose what model and reasoning effort to use", nthSlashCompletionDescription(testSlashRegistry(), "/mo", 0).?);
-    try std.testing.expectEqualStrings("/models", nthSlashCompletion(testSlashRegistry(), "/mo", 1).?);
-    try std.testing.expectEqualStrings("start a fresh session and keep background processes", nthSlashCompletionDescription(testSlashRegistry(), "/cl", 0).?);
+    try std.testing.expectEqualStrings("start a fresh conversation while keeping managed processes", nthSlashCompletionDescription(testSlashRegistry(), "/cl", 0).?);
     try std.testing.expectEqualStrings("undo the latest tracked file operation", nthSlashCompletionDescription(testSlashRegistry(), "/un", 0).?);
     try std.testing.expectEqualStrings("open the fx feedback form", nthSlashCompletionDescription(testSlashRegistry(), "/fee", 0).?);
     try std.testing.expectEqualStrings("copy a private diagnostic trace", nthSlashCompletionDescription(testSlashRegistry(), "/tr", 0).?);
-    try std.testing.expectEqualStrings("compact older conversation turns", nthSlashCompletionDescription(testSlashRegistry(), "/comp", 0).?);
+    try std.testing.expectEqualStrings("summarize context into a fresh window", nthSlashCompletionDescription(testSlashRegistry(), "/comp", 0).?);
     try std.testing.expectEqualStrings("show alias availability", nthSlashCompletionDescription(testSlashRegistry(), "/ali", 0).?);
     try std.testing.expectEqualStrings("toggle Fast mode when supported", nthSlashCompletionDescription(testSlashRegistry(), "/fa", 0).?);
 }
 
 test "slash completion aliases participate in ranked order" {
-    try std.testing.expectEqualStrings("/background", firstSlashCompletion(testSlashRegistry(), "/ba").?);
-    try std.testing.expectEqual(@as(usize, 3), slashCompletionCount(testSlashRegistry(), "/ba"));
-    try std.testing.expectEqualStrings("/background", nthSlashCompletion(testSlashRegistry(), "/ba", 0).?);
-    try std.testing.expectEqualStrings("/balance", nthSlashCompletion(testSlashRegistry(), "/ba", 1).?);
-    try std.testing.expectEqualStrings("/feedback", nthSlashCompletion(testSlashRegistry(), "/ba", 2).?);
+    try std.testing.expectEqualStrings("/balance", firstSlashCompletion(testSlashRegistry(), "/ba").?);
+    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(testSlashRegistry(), "/ba"));
+    try std.testing.expectEqualStrings("/balance", nthSlashCompletion(testSlashRegistry(), "/ba", 0).?);
+    try std.testing.expectEqualStrings("/feedback", nthSlashCompletion(testSlashRegistry(), "/ba", 1).?);
     try std.testing.expectEqualStrings("/balance", firstSlashCompletion(testSlashRegistry(), "/bal").?);
 }
 
@@ -2090,7 +2166,7 @@ test "rendered slash welcome excludes non-welcome help entries" {
     try std.testing.expect(std.mem.find(u8, welcome_text, "/clear") != null);
     try std.testing.expect(std.mem.find(u8, welcome_text, "/new") != null);
     try std.testing.expect(std.mem.find(u8, welcome_text, "/status") != null);
-    try std.testing.expect(std.mem.find(u8, welcome_text, "/background") != null);
+    try std.testing.expect(std.mem.find(u8, welcome_text, "/background") == null);
     try std.testing.expect(std.mem.find(u8, welcome_text, "/pr") == null);
     try std.testing.expect(std.mem.find(u8, welcome_text, "/issue") == null);
     try std.testing.expect(std.mem.find(u8, welcome_text, "/permissions") != null);
@@ -2121,3 +2197,18 @@ test "top-level help lines fit representative terminal widths" {
         try expectAllLinesFit(text, width);
     }
 }
+
+pub const slack_install_spec: TopLevelSpec = .{
+    .kind = .slack,
+    .token = "slack",
+    .usage = "slack <install|status|refresh> [--json]",
+    .summary = "Install and manage the workspace Slack bot locally",
+    .options = &.{.{ .flag = "--json", .description = "Emit installation metadata without credentials" }},
+    .details = &.{
+        "install opens Slack authorization through fx.sh and saves the bot credentials on this computer.",
+        "status shows local installation metadata; refresh renews tokens without browser authorization.",
+        "This is a workspace bot installer. Employee MCP login remains fx mcp auth NAME.",
+        "Credentials are saved in ~/.fx/slack/installation.json with owner-only permissions.",
+        "Refresh runs only when requested; no background service is installed.",
+    },
+};

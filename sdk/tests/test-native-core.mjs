@@ -2,27 +2,21 @@
 import { strict as assert } from "node:assert";
 import { relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../node.js";
+import { createFxEngine } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const defaultAddon = resolve(scriptDir, "../../zig-out/lib/libfx.node");
 const addon = process.argv[2] || `./${relative(process.cwd(), defaultAddon)}`;
 const events = [];
-const agent = await createFxAgent({
+const agent = await createFxEngine({
   nativeAddon: addon,
   backend: "native",
-  env: { AI_GATEWAY_API_KEY: "native-core-test-key" },
+  apiKey: "native-core-test-key",
   onEvent(event) { events.push(event); },
 });
-const session = await agent.createSession();
-assert.equal(typeof session.id, "string");
-assert.ok(session.id.length > 0);
-assert.ok(Array.isArray(session.configOptions));
-assert.ok(session.modes);
-const sessions = await agent.listSessions();
-assert.ok(Array.isArray(sessions));
-await session.close();
-assert.equal(await agent.close(), 0);
+assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "followUp", "prompt", "resume", "sessionId"]);
+assert.ok((await agent.checkpoint()).length > 0);
+assert.equal(await agent.close(), undefined);
 assert.ok(events.some((event) => event.type === "runtime.ready"));
 assert.ok(events.some((event) => event.type === "acp.receive"));
-console.log("native core passed: initialize, session/new, session/list, and graceful close");
+console.log("native core passed: minimal agent initialization, checkpoint, and graceful close");

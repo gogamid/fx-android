@@ -14,6 +14,17 @@ pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+/// Returns `text` repeated `count` times as a comptime string literal.
+pub inline fn repeat(comptime text: []const u8, comptime count: usize) *const [text.len * count:0]u8 {
+    return comptime blk: {
+        const units: [count][text.len]u8 = @splat(text[0..text.len].*);
+        var bytes: [text.len * count:0]u8 = @splat(0);
+        @memcpy(bytes[0 .. text.len * count], @as(*const [text.len * count]u8, @ptrCast(&units)));
+        const final = bytes;
+        break :blk &final;
+    };
+}
+
 pub fn isModelSafeText(text: []const u8) bool {
     if (std.mem.findScalar(u8, text, 0) != null) return false;
     return std.unicode.utf8ValidateSlice(text);
@@ -150,8 +161,7 @@ pub const IncrementalTerminalSafeEncoder = struct {
         try writer.writeAll(token.bytes);
         const remaining = self.pending_len - token.source_len;
         if (remaining > 0) {
-            std.mem.copyForwards(
-                u8,
+            @memmove(
                 self.pending[0..remaining],
                 self.pending[token.source_len..self.pending_len],
             );
@@ -174,7 +184,7 @@ pub const IncrementalUtf8Validator = struct {
             self.pending_len += copied;
             index += copied;
             if (self.pending_len < sequence_len) return;
-            _ = std.unicode.utf8Decode(self.pending[0..sequence_len]) catch return error.InvalidUtf8;
+            _ = display_width.decodeUtf8Sequence(self.pending[0..sequence_len]) catch return error.InvalidUtf8;
             self.pending_len = 0;
         }
 
@@ -186,7 +196,7 @@ pub const IncrementalUtf8Validator = struct {
                 self.pending_len = remaining.len;
                 return;
             }
-            _ = std.unicode.utf8Decode(bytes[index .. index + sequence_len]) catch return error.InvalidUtf8;
+            _ = display_width.decodeUtf8Sequence(bytes[index .. index + sequence_len]) catch return error.InvalidUtf8;
             index += sequence_len;
         }
     }
@@ -211,7 +221,7 @@ pub fn encodeTerminalSafePathTail(
     raw: []const u8,
     max_encoded_bytes: usize,
 ) error{ OutOfMemory, PathBasenameTooLong }!EncodedPathTail {
-    const basename = std.fs.path.basename(raw);
+    const basename = std.Io.Dir.path.basename(raw);
     if (basename.len == 0) return error.PathBasenameTooLong;
     const basename_source_start = raw.len - basename.len;
 
@@ -379,6 +389,33 @@ pub fn encodeTerminalSafe(
     };
 }
 
+/// Like `encodeTerminalSafe`, but first flattens every run of ASCII
+/// whitespace (including line breaks and tabs) into a single space and trims
+/// the ends, so multi-line human-readable text stays readable inside a
+/// one-line summary. Non-whitespace control bytes and invalid UTF-8 still get
+/// visible `\xNN` escapes.
+pub fn encodeTerminalSafeInline(
+    alloc: std.mem.Allocator,
+    raw: []const u8,
+    max_encoded_bytes: usize,
+) error{OutOfMemory}!EncodedText {
+    var flattened: std.ArrayList(u8) = .empty;
+    defer flattened.deinit(alloc);
+    var pending_space = false;
+    for (raw) |byte| {
+        if (std.ascii.isWhitespace(byte)) {
+            pending_space = flattened.items.len > 0;
+            continue;
+        }
+        if (pending_space) {
+            try flattened.append(alloc, ' ');
+            pending_space = false;
+        }
+        try flattened.append(alloc, byte);
+    }
+    return encodeTerminalSafe(alloc, flattened.items, max_encoded_bytes);
+}
+
 /// Returns true when `raw` is valid printable terminal text and
 /// `encodeTerminalSafe` would preserve it byte-for-byte.
 pub fn isTerminalSafe(raw: []const u8) bool {
@@ -424,7 +461,7 @@ pub fn clippedLabel(buf: []u8, text: []const u8, max_len: usize) []const u8 {
 
 pub fn sanitizeModelText(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     if (isModelSafeText(text)) return text;
-    return std.fmt.allocPrint(arena, "binary or non-utf8 tool output omitted ({d} bytes)", .{text.len});
+    return arena.print("binary or non-utf8 tool output omitted ({d} bytes)", .{text.len});
 }
 
 pub fn maskSecrets(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
@@ -437,7 +474,7 @@ pub fn maskSecrets(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
             modified = true;
             try out.writer.writeAll(text[i..span.prefix_end]);
             try out.writer.writeAll("[redacted]");
-            debug_trace.logf("core", "model-facing secret redacted kind={s} bytes={d}", .{ span.kind, span.value_len });
+            debug_trace.logf("core", "secret redacted kind={s} bytes={d}", .{ span.kind, span.value_len });
             i = span.prefix_end + span.value_len;
         } else {
             try out.writer.writeByte(text[i]);
@@ -547,7 +584,7 @@ fn terminalSafeToken(raw: []const u8, index: usize, buf: *[12]u8) TerminalSafeTo
     }
 
     const sequence = raw[index .. index + sequence_len];
-    const codepoint = std.unicode.utf8Decode(sequence) catch {
+    const codepoint = display_width.decodeUtf8Sequence(sequence) catch {
         return .{ .source_len = 1, .bytes = writeByteEscape(buf, byte) };
     };
     if (isNonPrintingCodepoint(codepoint)) {
@@ -618,9 +655,12 @@ fn findSecretSpan(text: []const u8, start: usize) ?SecretSpan {
     if (matchesAwsAccessKey(text, start)) |span| return span;
     if (matchesSensitiveAssignment(text, start)) |span| return span;
     for (secret_prefixes) |prefix| {
-        if (start + prefix.len < text.len and eqlIgnoreCase(text[start .. start + prefix.len], prefix)) {
+        if ((start == 0 or !isAssignmentKeyChar(text[start - 1])) and
+            start + prefix.len < text.len and
+            eqlIgnoreCase(text[start .. start + prefix.len], prefix))
+        {
             const value_start = start + prefix.len;
-            if (assignmentValueSpan(text, value_start)) |value| {
+            if (secretAssignmentValueSpan(text, start, value_start)) |value| {
                 return .{ .prefix_end = value.prefix_end, .value_len = value.value_len, .kind = "assignment" };
             }
         }
@@ -704,7 +744,7 @@ fn matchesSensitiveAssignment(text: []const u8, start: usize) ?SecretSpan {
     if (!sensitiveAssignmentKey(key)) return null;
 
     const value_start = eq + 1;
-    if (assignmentValueSpan(text, value_start)) |value| {
+    if (secretAssignmentValueSpan(text, start, value_start)) |value| {
         return .{ .prefix_end = value.prefix_end, .value_len = value.value_len, .kind = "assignment" };
     }
     return null;
@@ -715,7 +755,71 @@ const AssignmentValueSpan = struct {
     value_len: usize,
 };
 
-fn assignmentValueSpan(text: []const u8, value_start: usize) ?AssignmentValueSpan {
+fn secretAssignmentValueSpan(
+    text: []const u8,
+    assignment_start: usize,
+    value_start: usize,
+) ?AssignmentValueSpan {
+    const value = assignmentValueSpan(text, assignment_start, value_start) orelse return null;
+    if (isPureSymbolicAssignment(text, assignment_start, value_start, value)) return null;
+    return value;
+}
+
+fn isPureSymbolicAssignment(
+    text: []const u8,
+    assignment_start: usize,
+    value_start: usize,
+    value: AssignmentValueSpan,
+) bool {
+    if (text[value_start] == '\'') return false;
+    if (!isPureShellVariableReference(
+        text[value.prefix_end .. value.prefix_end + value.value_len],
+    )) return false;
+    const value_end = value.prefix_end + value.value_len;
+    const outer_double_quoted = assignment_start > 0 and
+        text[assignment_start - 1] == '"';
+    if (text[value_start] != '"' and !outer_double_quoted) {
+        return value_end == text.len or isShellWordBoundary(text, value_end);
+    }
+
+    const closing_quote = value_end;
+    if (closing_quote >= text.len or text[closing_quote] != '"') return false;
+    const next = closing_quote + 1;
+    return next == text.len or isShellWordBoundary(text, next);
+}
+
+fn isShellWordBoundary(text: []const u8, index: usize) bool {
+    return switch (text[index]) {
+        ' ', '\t', '\n', ';', '&', '|', ')' => true,
+        '<', '>' => index + 1 == text.len or text[index + 1] != '(',
+        else => false,
+    };
+}
+
+fn isPureShellVariableReference(value: []const u8) bool {
+    if (value.len < 2 or value[0] != '$') return false;
+    if (value[1] == '{') {
+        if (value.len < 4 or value[value.len - 1] != '}') return false;
+        return isShellVariableName(value[2 .. value.len - 1]);
+    }
+    return isShellVariableName(value[1..]);
+}
+
+fn isShellVariableName(value: []const u8) bool {
+    if (value.len == 0 or !(std.ascii.isAlphabetic(value[0]) or value[0] == '_')) {
+        return false;
+    }
+    for (value[1..]) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return false;
+    }
+    return true;
+}
+
+fn assignmentValueSpan(
+    text: []const u8,
+    assignment_start: usize,
+    value_start: usize,
+) ?AssignmentValueSpan {
     if (value_start >= text.len) return null;
 
     if (text[value_start] == '"' or text[value_start] == '\'') {
@@ -725,6 +829,16 @@ fn assignmentValueSpan(text: []const u8, value_start: usize) ?AssignmentValueSpa
         while (end < text.len and text[end] != '\n' and text[end] != '\r' and text[end] != quote) : (end += 1) {}
         const value_len = end - content_start;
         if (value_len >= 1) return .{ .prefix_end = content_start, .value_len = value_len };
+        return null;
+    }
+
+    if (assignment_start > 0 and text[assignment_start - 1] == '"') {
+        var end = value_start;
+        while (end < text.len and text[end] != '\n' and text[end] != '\r' and
+            text[end] != '"') : (end += 1)
+        {}
+        const value_len = end - value_start;
+        if (value_len >= 1) return .{ .prefix_end = value_start, .value_len = value_len };
         return null;
     }
 
@@ -893,6 +1007,76 @@ test "maskSecrets masks quoted sensitive assignments" {
     try std.testing.expect(std.mem.find(u8, masked, "access-secret") == null);
 }
 
+test "maskSecrets preserves pure symbolic sensitive assignments" {
+    const alloc = std.testing.allocator;
+    const input =
+        "AI_GATEWAY_API_KEY=\"$key\"\n" ++
+        "sandbox -e \"AI_GATEWAY_API_KEY=$key\" \"$@\"\n" ++
+        "GITHUB_TOKEN=$token\n" ++
+        "DATABASE_URL=\"${database_url}\"\n" ++
+        "TOKEN=\"$token\"; run-next\n" ++
+        "PASSWORD=\"$password\"\tcheck-next\n" ++
+        "ACCESS_TOKEN=\"$token\">token.out\n" ++
+        "SECRET_KEY=\"$key\")";
+
+    const masked = try maskSecrets(alloc, input);
+    defer if (masked.ptr != input.ptr) alloc.free(masked);
+
+    try std.testing.expectEqualStrings(input, masked);
+}
+
+test "maskSecrets masks compound or literal sensitive assignments" {
+    const alloc = std.testing.allocator;
+    const input =
+        "AI_GATEWAY_API_KEY=\"literal-value\"\n" ++
+        "sandbox -e \"AI_GATEWAY_API_KEY=literal-value\"\n" ++
+        "sandbox -e \"AI_GATEWAY_API_KEY=$key literal-suffix\"\n" ++
+        "sandbox -e \"GITHUB_TOKEN=$token;literal-suffix\"\n" ++
+        "sandbox -e \"ACCESS_TOKEN=$token>token.out\"\n" ++
+        "sandbox -e \"SECRET_KEY=$key$tail\"\n" ++
+        "sandbox -e \"GITHUB_TOKEN=$token-suffix\"\n" ++
+        "sandbox -e \"API_KEY=$(load-key)\"\n" ++
+        "GITHUB_TOKEN=\"$token-suffix\"\n" ++
+        "DATABASE_URL=\"${database_url:-fallback}\"\n" ++
+        "API_KEY=\"$(load-key)\"\n" ++
+        "VERCEL_OIDC_TOKEN=\"$token\"literal-suffix\n" ++
+        "OPENAI_API_KEY=$key\"literal-suffix\"\n" ++
+        "PASSWORD=\"$password\"\x0bliteral-suffix\n" ++
+        "ACCESS_TOKEN=\"$token\"\x0cliteral-suffix\n" ++
+        "SECRET=\"$secret\"\rliteral-suffix\n" ++
+        "AI_GATEWAY_API_KEY=\"$key\"(literal-suffix)\n" ++
+        "GITHUB_TOKEN=\"$token\"<(literal-suffix)\n" ++
+        "ACCESS_TOKEN=\"$token\">(literal-suffix)\n" ++
+        "SECRET_KEY=\"$key";
+
+    const masked = try maskSecrets(alloc, input);
+    defer if (masked.ptr != input.ptr) alloc.free(masked);
+
+    try std.testing.expectEqualStrings(
+        "AI_GATEWAY_API_KEY=\"[redacted]\"\n" ++
+            "sandbox -e \"AI_GATEWAY_API_KEY=[redacted]\"\n" ++
+            "sandbox -e \"AI_GATEWAY_API_KEY=[redacted]\"\n" ++
+            "sandbox -e \"GITHUB_TOKEN=[redacted]\"\n" ++
+            "sandbox -e \"ACCESS_TOKEN=[redacted]\"\n" ++
+            "sandbox -e \"SECRET_KEY=[redacted]\"\n" ++
+            "sandbox -e \"GITHUB_TOKEN=[redacted]\"\n" ++
+            "sandbox -e \"API_KEY=[redacted]\"\n" ++
+            "GITHUB_TOKEN=\"[redacted]\"\n" ++
+            "DATABASE_URL=\"[redacted]\"\n" ++
+            "API_KEY=\"[redacted]\"\n" ++
+            "VERCEL_OIDC_TOKEN=\"[redacted]\"literal-suffix\n" ++
+            "OPENAI_API_KEY=[redacted]\"literal-suffix\"\n" ++
+            "PASSWORD=\"[redacted]\"\x0bliteral-suffix\n" ++
+            "ACCESS_TOKEN=\"[redacted]\"\x0cliteral-suffix\n" ++
+            "SECRET=\"[redacted]\"\rliteral-suffix\n" ++
+            "AI_GATEWAY_API_KEY=\"[redacted]\"(literal-suffix)\n" ++
+            "GITHUB_TOKEN=\"[redacted]\"<(literal-suffix)\n" ++
+            "ACCESS_TOKEN=\"[redacted]\">(literal-suffix)\n" ++
+            "SECRET_KEY=\"[redacted]",
+        masked,
+    );
+}
+
 test "maskSecrets preserves non-sensitive quoted assignments" {
     const alloc = std.testing.allocator;
     const input = "PROJECT_NAME=\"secret-service\"\nGREETING='hello world'";
@@ -995,10 +1179,49 @@ test "encodeTerminalSafe visibly escapes controls line breaks and invalid UTF-8"
         "A\\x1b[31m\\x0a\\x0d\\x07\\x7fB\\xff",
         encoded.bytes,
     );
-    try std.testing.expect(std.mem.indexOfScalar(u8, encoded.bytes, 0x1b) == null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, encoded.bytes, '\n') == null);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, '\n') == null);
     try std.testing.expect(std.unicode.utf8ValidateSlice(encoded.bytes));
     try std.testing.expect(!encoded.truncated);
+}
+
+test "encodeTerminalSafeInline flattens whitespace runs and trims the ends" {
+    const raw = "  {\n  \"success\": false,\r\n\t\"info\": \"nope\"}\n";
+    var encoded = try encodeTerminalSafeInline(std.testing.allocator, raw, 256);
+    defer encoded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(
+        "{ \"success\": false, \"info\": \"nope\"}",
+        encoded.bytes,
+    );
+    try std.testing.expect(!encoded.truncated);
+}
+
+test "encodeTerminalSafeInline still escapes dangerous controls and invalid UTF-8" {
+    const raw = "a\x1b[31m\nb\x07\xff";
+    var encoded = try encodeTerminalSafeInline(std.testing.allocator, raw, 256);
+    defer encoded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("a\\x1b[31m b\\x07\\xff", encoded.bytes);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, '\n') == null);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(encoded.bytes));
+}
+
+test "encodeTerminalSafeInline collapses whitespace-only input to empty" {
+    var encoded = try encodeTerminalSafeInline(std.testing.allocator, " \n\t\r\n ", 256);
+    defer encoded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("", encoded.bytes);
+    try std.testing.expect(!encoded.truncated);
+}
+
+test "encodeTerminalSafeInline applies the byte budget after flattening" {
+    var encoded = try encodeTerminalSafeInline(std.testing.allocator, "one  two\nthree", 8);
+    defer encoded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("one t...", encoded.bytes);
+    try std.testing.expect(encoded.truncated);
 }
 
 test "isTerminalSafe matches byte-preserving terminal encoding" {
@@ -1035,7 +1258,7 @@ test "incremental terminal-safe encoding matches the whole-slice policy at every
         try encoder.append(&out.writer, raw[split..]);
         try encoder.finish(&out.writer);
         try std.testing.expectEqualStrings(expected.bytes, out.written());
-        try std.testing.expect(std.mem.indexOfScalar(u8, out.written(), 0x1b) == null);
+        try std.testing.expect(std.mem.findScalar(u8, out.written(), 0x1b) == null);
     }
 }
 
@@ -1065,7 +1288,7 @@ test "encodeTerminalSafe makes every byte value terminal-safe UTF-8" {
     for (encoded.bytes) |byte| {
         try std.testing.expect(byte >= 0x20 and byte != 0x7f);
     }
-    try std.testing.expect(std.mem.indexOfScalar(u8, encoded.bytes, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, 0x1b) == null);
     try std.testing.expect(!encoded.truncated);
 }
 
@@ -1090,8 +1313,7 @@ test "encodeTerminalSafePathTail preserves a complete basename from a long sourc
     const prefix = try std.testing.allocator.alloc(u8, 5 * 1024);
     defer std.testing.allocator.free(prefix);
     @memset(prefix, 'a');
-    const raw = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const raw = try std.testing.allocator.print(
         "/{s}/note.txt",
         .{prefix},
     );
@@ -1185,7 +1407,7 @@ test "encodeTerminalSafePathTail keeps hostile UTF-8 and escape tokens whole" {
     defer encoded.deinit(std.testing.allocator);
 
     try std.testing.expect(std.unicode.utf8ValidateSlice(encoded.bytes));
-    try std.testing.expect(std.mem.indexOfScalar(u8, encoded.bytes, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, 0x1b) == null);
     try std.testing.expect(
         std.mem.find(u8, encoded.bytes, "\\x1b") != null,
     );

@@ -1,32 +1,28 @@
 const std = @import("std");
 const config_runtime = @import("../config/config_runtime.zig");
-const background_process_provider = @import(
-    "../execution/background_process_provider.zig",
-);
+const process_provider = @import("../execution/process_provider.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
-const model_catalog = @import("../gateway/model_catalog.zig");
-const agent_stream_provider = @import("../agent/stream_provider.zig");
+const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
+const host_attachments = @import("../hosts/host_attachments.zig");
+const credentials = @import("../auth/credentials.zig");
+const model_provider = @import("../config/model_provider.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
-const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const Config = struct {
+    auth_mode: credentials.AuthMode = .local,
     default_model: []const u8,
     default_agent_step_limit: usize,
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
     gateway_models_path: []const u8,
     gateway_provider: gateway_provider.Provider,
-    codex_agent_stream: ?agent_stream_provider.Provider = null,
-    codex_model_catalog: ?model_catalog.Provider = null,
-    grok_agent_stream: ?agent_stream_provider.Provider = null,
-    grok_model_catalog: ?model_catalog.Provider = null,
-    background_process_provider: background_process_provider.Provider =
-        background_process_provider.unavailable_provider,
+    provider_set: provider_set.Set,
+    process_provider: process_provider.Provider = process_provider.unavailable_provider,
     secret_store: host.SecretStore,
     prompt_policy: prompt_policy.Policy,
     ignored_list_entries: []const []const u8,
@@ -39,10 +35,26 @@ pub const Config = struct {
     max_history_turns: usize,
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
-    permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
-    codex_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
-    grok_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     model_override: ?[]const u8 = null,
+    /// Raw reasoning-effort override using the kernel's ReasoningEffort.parse
+    /// vocabulary. Borrowed; must outlive the server run.
+    effort_override: ?[]const u8 = null,
+    /// Fast-lane override matching --fast/--no-fast. Null leaves the startup
+    /// and session defaults untouched.
+    fast_override: ?bool = null,
+    /// Ultrafast-lane override. Null leaves the startup and session defaults
+    /// untouched.
+    ultrafast_override: ?bool = null,
+    /// Provider for every session this server runs, like model_override. Null
+    /// keeps the startup provider and each saved session's own provider.
+    provider_override: ?model_provider.ProviderId = null,
+    /// `.host_managed` sends requests to every provider but Gateway (Codex,
+    /// Grok and a configured provider) without a credential; the host adds one
+    /// at its fetch edge. Gateway keeps `auth_mode`.
+    provider_auth_mode: credentials.AuthMode = .local,
+    /// For `minimal_kernel` runs: a settings-style providers object whose
+    /// providers the run may use. Borrowed for the server's lifetime.
+    configured_providers_json: ?[]const u8 = null,
     credential_override: ?[]const u8 = null,
     home_override: ?[]const u8 = null,
     workspace_root_override: ?[]const u8 = null,
@@ -52,6 +64,10 @@ pub const Config = struct {
     saved_directories_suppressed: bool = false,
     allow_acp_mcp: bool = true,
     allow_native_tools: bool = true,
+    minimal_kernel: bool = false,
+    /// Raw prompt image and checkpoint bytes from a libfx host. Null for
+    /// hosts that only speak standard ACP, such as `fx acp`.
+    host_attachments: ?host_attachments.Store = null,
 };
 
 pub const RunFn = *const fn (?*anyopaque, Allocator, Config) anyerror!void;

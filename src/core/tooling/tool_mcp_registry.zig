@@ -40,7 +40,7 @@ fn dynamicTool(name: []const u8) tool_dispatch.Tool {
     return .{
         .name = name,
         .description = "Selected dynamic MCP tool.",
-        .gateway_schema = .{
+        .model_schema = .{
             .name = name,
             .description = "Selected dynamic MCP tool.",
         },
@@ -94,7 +94,9 @@ fn call(
     } orelse return unsupported(ctx);
     const status = output.status;
     if (ctx.mcp_call_status_sink) |sink| sink.* = status;
+    const images = output.takeImages();
     const body = @constCast(output.takeModelOutput(ctx.allocator));
+    if (images.len > 0) return .{ .rich = .{ .text = body, .images = images, .is_error = status != .success } };
     return switch (status) {
         .success => .{ .success = body },
         .tool_failure, .protocol_failure, .input_required => .{ .failure = body },
@@ -104,8 +106,7 @@ fn call(
 fn unsupported(
     ctx: tool_dispatch.DispatchContext,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    return .{ .failure = try std.fmt.allocPrint(
-        ctx.allocator,
+    return .{ .failure = try ctx.allocator.print(
         "Unsupported tool: {s}",
         .{ctx.tool_call_name},
     ) };

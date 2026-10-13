@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const types = @import("../../shared/types.zig");
@@ -19,7 +20,7 @@ const runtime_deps = @import("deps.zig");
 const runtime_telemetry = @import("telemetry.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
-const model_response_recovery = @import("model_response_recovery.zig");
+const response_language = @import("response_language.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -35,12 +36,13 @@ const SecondaryPublicationReport = runtime_tool_contracts.SecondaryPublicationRe
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 const TablePayload = assistant_presentation.TablePayload;
 const CodeBlockPayload = assistant_presentation.CodeBlockPayload;
+const response_language_probe_limit_bytes: usize = 4096;
 
 const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.read_file,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
-    test_builtin_tools.terminal,
+    test_builtin_tools.shell,
     test_builtin_tools.ask_user_question,
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
@@ -71,12 +73,19 @@ pub const StreamChunkContext = struct {
     first_model_output_at_ms: ?i64 = null,
     markdown: assistant_presentation.MarkdownProcessor = .{},
     raw_text: std.ArrayList(u8) = .empty,
-    continuation_pending: std.ArrayList(u8) = .empty,
-    continuation_prefix_len: usize = 0,
-    continuation_probe_remaining: usize = 0,
-    continuation_resolved: bool = true,
+    /// Every streamed byte counts as progress for the stall detector: text,
+    /// reasoning, and tool-input chunks alike. A turn composing one large
+    /// tool call must not read as zero progress.
+    streamed_output_bytes: usize = 0,
+    interrupted_source: std.ArrayList(u8) = .empty,
+    response_started: bool = false,
+    published_phase: ?types.TurnPhase = null,
     initial_line_prefix: std.ArrayList(u8) = .empty,
     provisional_statuses: runtime_tool_presentation.ProvisionalToolStatuses = .{},
+    response_language_expected: ?response_language.Script = null,
+    response_language_accepted: bool = false,
+    response_language_hold_until_completion: bool = false,
+    response_language_next_probe_bytes: usize = 5,
 
     fn markModelOutput(self: *StreamChunkContext) void {
         if (self.first_model_output_at_ms == null) self.first_model_output_at_ms = io_mod.milliTimestamp();
@@ -113,26 +122,101 @@ pub const StreamChunkContext = struct {
     pub fn deinit(self: *StreamChunkContext) void {
         self.markdown.deinit(self.alloc);
         self.raw_text.deinit(self.alloc);
-        self.continuation_pending.deinit(self.alloc);
+        self.interrupted_source.deinit(self.alloc);
         self.initial_line_prefix.deinit(self.alloc);
         self.provisional_statuses.deinit(self.alloc);
     }
 
-    pub fn beginRecoveryAttempt(self: *StreamChunkContext) void {
-        self.continuation_pending.clearRetainingCapacity();
-        self.continuation_prefix_len = self.raw_text.items.len;
-        self.continuation_probe_remaining = self.continuation_prefix_len;
-        self.continuation_resolved = self.continuation_prefix_len == 0;
+    pub fn start_response(self: *StreamChunkContext) !void {
+        if (self.response_started) return;
+        try self.hooks.push_text(self.hooks.ctx, .assistant_started);
+        self.response_started = true;
+    }
+
+    pub fn beginRecoveryAttempt(self: *StreamChunkContext) !void {
+        if (self.response_language_staging()) {
+            self.drop_staged_response_language_candidate();
+        }
+        if (self.raw_text.items.len > 0) {
+            try flushAssistantStream(self);
+            try self.hooks.push_text(self.hooks.ctx, .{
+                .assistant_restarted = "\n\n[Response interrupted. Restarting.]\n\n",
+            });
+            debug_trace.logf("agent", "restarting response preview_bytes={d} superseded_preview_bytes={d}", .{
+                self.raw_text.items.len,
+                self.interrupted_source.items.len,
+            });
+            std.mem.swap(std.ArrayList(u8), &self.raw_text, &self.interrupted_source);
+            self.raw_text.clearRetainingCapacity();
+        }
+        self.markdown.deinit(self.alloc);
+        self.markdown = .{};
+        self.initial_line_prefix.clearRetainingCapacity();
+        self.saw_visible_text = false;
+        self.response_started = false;
+        self.last_byte_was_newline = false;
+        self.trailing_newline_count = 0;
+        self.response_language_accepted = false;
+        self.response_language_next_probe_bytes = 5;
         self.saw_tool_start = false;
         self.saw_provider_tool_start = false;
         self.saw_visible_text_after_tool_start = false;
         self.first_model_output_at_ms = null;
+        self.streamed_output_bytes = 0;
+        self.published_phase = null;
+    }
+
+    pub fn accepted_source(self: *const StreamChunkContext) []const u8 {
+        return if (self.response_language_staging()) "" else self.raw_text.items;
+    }
+
+    pub fn accepted_source_or(self: *const StreamChunkContext, fallback: []const u8) []const u8 {
+        if (self.response_language_staging()) return "";
+        return if (self.raw_text.items.len > 0) self.raw_text.items else fallback;
+    }
+
+    pub fn interruption_source_or(self: *const StreamChunkContext, fallback: []const u8) []const u8 {
+        if (!self.response_language_staging()) {
+            if (self.raw_text.items.len > 0) return self.raw_text.items;
+            return if (fallback.len > 0) fallback else self.interrupted_source.items;
+        }
+        const candidate = if (self.raw_text.items.len > 0) self.raw_text.items else fallback;
+        if (candidate.len == 0) return self.interrupted_source.items;
+        const actual = response_language.evidence(candidate).script orelse return candidate;
+        return if (actual == self.response_language_expected.?) candidate else self.interrupted_source.items;
+    }
+
+    pub fn accept_staged_response_language(self: *StreamChunkContext) !void {
+        if (!self.response_language_staging()) return;
+        self.response_language_accepted = true;
+        try publishAssistantChunkResolved(self, self.raw_text.items);
+    }
+
+    pub fn drop_staged_response_language_candidate(self: *StreamChunkContext) void {
+        if (!self.response_language_staging()) return;
+        if (self.raw_text.items.len > 0) {
+            debug_trace.logf(
+                "agent",
+                "dropping rejected response language candidate bytes={d}",
+                .{self.raw_text.items.len},
+            );
+        }
+        self.raw_text.clearRetainingCapacity();
+        self.initial_line_prefix.clearRetainingCapacity();
+        self.saw_visible_text = false;
+        self.last_byte_was_newline = false;
+        self.trailing_newline_count = 0;
+        self.response_language_next_probe_bytes = 5;
+    }
+
+    fn response_language_staging(self: *const StreamChunkContext) bool {
+        return self.response_language_expected != null and
+            !self.response_language_accepted;
     }
 
     /// Restores durable partial source before a restarted turn sends anything.
-    /// The following attempt can then suppress an exact repeated prefix
-    /// against these same raw bytes. Interactive surfaces that already show
-    /// the partial source restore presentation state without emitting it again.
+    /// The next attempt retains it as interruption evidence and starts fresh.
+    /// Surfaces that already show the preview do not emit it again here.
     pub fn restoreRecoverySource(
         self: *StreamChunkContext,
         source: []const u8,
@@ -140,44 +224,20 @@ pub const StreamChunkContext = struct {
     ) !void {
         if (source.len == 0) return;
         if (already_presented) {
-            try self.restorePresentedRecoverySource(source);
+            try self.raw_text.appendSlice(self.alloc, source);
+            self.response_language_accepted = true;
             return;
         }
         try streamAssistantChunk(self, source);
         try flushAssistantStream(self);
-        try self.markdown.restorePresentedPrefix(self.alloc, source);
-    }
-
-    fn restorePresentedRecoverySource(
-        self: *StreamChunkContext,
-        source: []const u8,
-    ) !void {
-        try self.raw_text.appendSlice(self.alloc, source);
-        try self.hooks.push_text(self.hooks.ctx, .{ .assistant_source = source });
-
-        var start: usize = 0;
-        while (start < source.len and isTrimmedAssistantPrefixByte(source[start])) : (start += 1) {
-            switch (source[start]) {
-                ' ', '\t' => try self.initial_line_prefix.append(self.alloc, source[start]),
-                '\n' => self.initial_line_prefix.clearRetainingCapacity(),
-                else => {},
-            }
-        }
-        if (start == source.len) {
-            self.initial_line_prefix.clearRetainingCapacity();
-            return;
-        }
-        self.saw_visible_text = true;
-
-        self.initial_line_prefix.clearRetainingCapacity();
-        try self.markdown.restorePresentedPrefix(self.alloc, source);
-        self.recordTextOutput(source);
     }
 };
 
 pub fn onStreamContentChunk(ctx: *anyopaque, chunk: []const u8) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
     stream_ctx.markModelOutput();
+    stream_ctx.streamed_output_bytes += chunk.len;
+    publishTurnPhase(stream_ctx, .generating);
     if (stream_ctx.token_progress) |progress| {
         pushTokenProgressUpdate(stream_ctx, progress.consumeContent(chunk)) catch |err| {
             debug_trace.logf("agent", "token progress publication failed source=content err={s}", .{@errorName(err)});
@@ -191,24 +251,38 @@ pub fn onStreamContentChunk(ctx: *anyopaque, chunk: []const u8) void {
 
 pub fn onStreamReasoningChunk(ctx: *anyopaque, chunk: []const u8) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
+    stream_ctx.markModelOutput();
+    stream_ctx.streamed_output_bytes += chunk.len;
+    publishTurnPhase(stream_ctx, .thinking);
     if (stream_ctx.token_progress) |progress| {
         pushTokenProgressUpdate(stream_ctx, progress.consumeReasoning(chunk)) catch |err| {
             debug_trace.logf("agent", "token progress publication failed source=reasoning err={s}", .{@errorName(err)});
         };
     }
+    if (stream_ctx.hooks.push_reasoning_delta) |push| {
+        push(stream_ctx.hooks.ctx, chunk) catch |err| {
+            debug_trace.logf("agent", "reasoning publication failed err={s}", .{@errorName(err)});
+        };
+    }
 }
 
-/// Tools that publish no provisional status leave the activity row with
-/// nothing to say while their arguments stream, which can take as long as the
-/// response did. Tell the shell the turn is composing so the row stays alive.
-fn publishToolPayloadStarted(stream_ctx: *StreamChunkContext) void {
-    stream_ctx.hooks.push_event(stream_ctx.hooks.ctx, .tool_payload_started) catch |err| {
-        debug_trace.logf("agent", "tool payload notice publication failed err={s}", .{@errorName(err)});
+pub fn publishTurnPhase(stream_ctx: *StreamChunkContext, phase: types.TurnPhase) void {
+    if (stream_ctx.published_phase == phase) return;
+    stream_ctx.hooks.push_event(stream_ctx.hooks.ctx, .{ .turn_phase_update = .{
+        .turn_id = stream_ctx.turn_id,
+        .step_id = stream_ctx.step_id,
+        .phase = phase,
+    } }) catch |err| {
+        debug_trace.logf("agent", "turn phase publication failed phase={s} err={s}", .{ @tagName(phase), @errorName(err) });
+        return;
     };
+    stream_ctx.published_phase = phase;
 }
 
 pub fn onStreamToolInputChunk(ctx: *anyopaque, chunk: []const u8) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
+    stream_ctx.streamed_output_bytes += chunk.len;
+    publishTurnPhase(stream_ctx, .running);
     if (stream_ctx.token_progress) |progress| {
         pushTokenProgressUpdate(stream_ctx, progress.consumeToolInput(chunk)) catch |err| {
             debug_trace.logf("agent", "token progress publication failed source=tool_input err={s}", .{@errorName(err)});
@@ -227,12 +301,12 @@ pub fn pushTokenProgressUpdate(stream_ctx: *StreamChunkContext, update: runtime_
     }
 }
 
-pub fn onStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []const u8, label_value: ?[]const u8) void {
+pub fn onStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []const u8, label_value: ?[]const u8, arguments_json: ?[]const u8) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
     const first_tool_in_step = !stream_ctx.saw_tool_start;
     recordStreamToolStart(ctx, tool_name);
     const preflight = runtime_tool_presentation.ProvisionalToolStatuses.preflight(stream_ctx.hooks.tool_registry, tool_name) orelse {
-        publishToolPayloadStarted(stream_ctx);
+        publishTurnPhase(stream_ctx, .running);
         return;
     };
     stream_ctx.markModelOutput();
@@ -251,11 +325,12 @@ pub fn onStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []cons
             .anchor_step_id = stream_ctx.step_id,
         };
     }
+    publishTurnPhase(stream_ctx, .running);
     switch (preflight) {
         // Published last: the flush above can push the response's trailing
         // newline, and any text landing after the notice reopens the response
         // row.
-        .ineligible => publishToolPayloadStarted(stream_ctx),
+        .ineligible => {},
         .eligible => |metadata| stream_ctx.provisional_statuses.publish(
             stream_ctx.hooks,
             stream_ctx.alloc,
@@ -265,6 +340,7 @@ pub fn onStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []cons
             metadata.activity_kind,
             metadata.action_label,
             label_value,
+            arguments_json,
         ) catch {},
     }
 }
@@ -281,22 +357,43 @@ pub fn recordStreamToolStart(ctx: *anyopaque, tool_name: []const u8) void {
 }
 
 fn streamAssistantChunk(stream_ctx: *StreamChunkContext, chunk: []const u8) !void {
-    if (!stream_ctx.continuation_resolved) {
-        try stream_ctx.continuation_pending.appendSlice(stream_ctx.alloc, chunk);
-        const overlap = try continuationOverlapIfResolved(stream_ctx, false) orelse return;
-        const novel = stream_ctx.continuation_pending.items[overlap..];
-        try streamAssistantChunkResolved(stream_ctx, novel);
-        stream_ctx.continuation_pending.clearRetainingCapacity();
-        return;
-    }
-    try streamAssistantChunkResolved(stream_ctx, chunk);
-}
-
-fn streamAssistantChunkResolved(stream_ctx: *StreamChunkContext, chunk: []const u8) !void {
     if (chunk.len == 0) return;
     const alloc = stream_ctx.alloc;
     try stream_ctx.raw_text.appendSlice(alloc, chunk);
+    if (stream_ctx.response_language_staging()) {
+        if (stream_ctx.response_language_hold_until_completion) return;
+        if (stream_ctx.raw_text.items.len >= stream_ctx.response_language_next_probe_bytes) {
+            const prefix_len = @min(
+                stream_ctx.raw_text.items.len,
+                response_language_probe_limit_bytes,
+            );
+            const prefix = stream_ctx.raw_text.items[0..prefix_len];
+            if (response_language.evidence(prefix).script == stream_ctx.response_language_expected) {
+                try stream_ctx.accept_staged_response_language();
+            } else if (prefix_len == response_language_probe_limit_bytes) {
+                stream_ctx.response_language_next_probe_bytes = std.math.maxInt(usize);
+            } else {
+                stream_ctx.response_language_next_probe_bytes = @min(
+                    response_language_probe_limit_bytes,
+                    @max(stream_ctx.raw_text.items.len +| 1, stream_ctx.raw_text.items.len *| 2),
+                );
+            }
+        }
+        return;
+    }
+    try publishAssistantChunkResolved(stream_ctx, chunk);
+}
+
+fn publishAssistantChunkResolved(stream_ctx: *StreamChunkContext, chunk: []const u8) !void {
+    if (chunk.len == 0) return;
+    const alloc = stream_ctx.alloc;
+    try stream_ctx.start_response();
     try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_source = chunk });
+    if (!stream_ctx.hooks.render_assistant_text) {
+        if (std.mem.trim(u8, chunk, " \t\r\n").len > 0) stream_ctx.saw_visible_text = true;
+        stream_ctx.recordTextOutput(chunk);
+        return;
+    }
 
     var start: usize = 0;
     var initial_prefix_to_emit: ?[]const u8 = null;
@@ -363,12 +460,8 @@ fn streamAssistantChunkResolved(stream_ctx: *StreamChunkContext, chunk: []const 
 }
 
 pub fn flushAssistantStream(stream_ctx: *StreamChunkContext) !void {
-    if (!stream_ctx.continuation_resolved) {
-        const overlap = (try continuationOverlapIfResolved(stream_ctx, true)).?;
-        const novel = stream_ctx.continuation_pending.items[overlap..];
-        try streamAssistantChunkResolved(stream_ctx, novel);
-        stream_ctx.continuation_pending.clearRetainingCapacity();
-    }
+    if (stream_ctx.response_language_staging()) return;
+    if (!stream_ctx.hooks.render_assistant_text) return;
     const alloc = stream_ctx.alloc;
     stream_ctx.initial_line_prefix.clearRetainingCapacity();
     var out: std.ArrayList(u8) = .empty;
@@ -410,33 +503,6 @@ pub fn flushAssistantStream(stream_ctx: *StreamChunkContext) !void {
         out.items;
     try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_rendered = text });
     stream_ctx.recordTextOutput(text);
-}
-
-fn continuationOverlapIfResolved(
-    stream_ctx: *StreamChunkContext,
-    final: bool,
-) !?usize {
-    const existing = stream_ctx.raw_text.items[0..stream_ctx.continuation_prefix_len];
-    const incoming = stream_ctx.continuation_pending.items;
-    if (!final) {
-        const probe = model_response_recovery.probeContinuationExtension(
-            existing,
-            incoming,
-            stream_ctx.continuation_probe_remaining,
-        );
-        stream_ctx.continuation_probe_remaining =
-            stream_ctx.continuation_probe_remaining -| probe.comparisons;
-        switch (probe.outcome) {
-            .may_extend, .budget_exhausted => return null,
-            .cannot_extend => {},
-        }
-    }
-    stream_ctx.continuation_resolved = true;
-    return try model_response_recovery.exactContinuationOverlap(
-        stream_ctx.alloc,
-        existing,
-        incoming,
-    );
 }
 
 fn beginsFootnoteProjection(text: []const u8) bool {
@@ -499,14 +565,14 @@ fn deliverSemanticThematicRule(raw: *anyopaque, out: *std.ArrayList(u8)) !void {
 
 pub fn emitProviderLengthNotice(hooks: *const AgentRuntimeDeps, arena: Allocator, disposition: types.ProviderCompletionDisposition) !void {
     if (disposition != .length_limited) return;
-    const line = try std.fmt.allocPrint(arena, "response hit provider length limit; output may be incomplete", .{});
+    const line = try arena.print("response hit provider length limit; output may be incomplete", .{});
     try hooks.push_system_notice(hooks.ctx, line);
 }
 
 pub fn finishLengthLimitedToolCallCompletion(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,
-    completion: types.GatewayCompletion,
+    completion: types.ModelCompletion,
     streamed_content_len: usize,
 ) ![]const u8 {
     const blocker = "Provider response hit the length limit, so I did not execute the returned tool calls. Latest partial response is preserved above; retry with a narrower prompt or inspect stored tool output before continuing.";
@@ -514,7 +580,7 @@ pub fn finishLengthLimitedToolCallCompletion(
     const has_content = completion.content != null and completion.content.?.len > 0;
     const normalized = if (has_content) try normalizeAssistantTextForDisplay(arena, completion.content.?) else "";
     const rendered = if (normalized.len > 0)
-        try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ normalized, blocker })
+        try arena.print("{s}\n\n{s}", .{ normalized, blocker })
     else
         blocker;
 
@@ -570,7 +636,7 @@ pub fn normalizeAssistantTextForDisplay(alloc: Allocator, raw_text: []const u8) 
     return trimmed;
 }
 
-pub fn historyTextForCompletedStream(raw_text: []const u8, normalized_text: []const u8) []const u8 {
+pub fn textForCompletedPresentation(raw_text: []const u8, normalized_text: []const u8) []const u8 {
     var lines = std.mem.splitScalar(u8, raw_text, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trimStart(u8, line, " \t");
@@ -581,21 +647,21 @@ pub fn historyTextForCompletedStream(raw_text: []const u8, normalized_text: []co
     return normalized_text;
 }
 
-test "completed history preserves raw fenced code while ordinary text stays normalized" {
+test "completed presentation preserves fenced code while ordinary text stays normalized" {
     const fenced = "```\nconst hook = await resumeHook(token, { cleanup: true } as CleanupSignal);\n```";
     const tilde_fenced = "~~~zig\nconst hook = await resumeHook(token, { cleanup: true } as CleanupSignal);\n~~~";
 
     try std.testing.expectEqualStrings(
         fenced,
-        historyTextForCompletedStream(fenced, "const hook = await resumeHook(token, { cleanup: true } as CleanupSignal);"),
+        textForCompletedPresentation(fenced, "const hook = await resumeHook(token, { cleanup: true } as CleanupSignal);"),
     );
     try std.testing.expectEqualStrings(
         tilde_fenced,
-        historyTextForCompletedStream(tilde_fenced, "const hook = await resumeHook(token, { cleanup: true } as CleanupSignal);"),
+        textForCompletedPresentation(tilde_fenced, "const hook = await resumeHook(token, { cleanup: true } as CleanupSignal);"),
     );
     try std.testing.expectEqualStrings(
         "Hello",
-        historyTextForCompletedStream(" **Hello** ", "Hello"),
+        textForCompletedPresentation(" **Hello** ", "Hello"),
     );
 }
 
@@ -641,7 +707,7 @@ const NoticeCapture = struct {
 
     fn appendRuntimeContext(_: *anyopaque, _: Allocator, _: *std.ArrayList(ChatMessage)) !void {}
 
-    fn requestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: PermissionMode, _: []const PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8) !command_admission.PermissionOutcome {
+    fn requestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: PermissionMode, _: []const PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8, _: ?[]const u8) !command_admission.PermissionOutcome {
         return .{
             .decision = .once,
             .execution_authority = .ordinary,
@@ -653,7 +719,7 @@ const NoticeCapture = struct {
     }
 
     fn describeDenied(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s} {s}", .{ label, call.name });
+        return arena.print("{s} {s}", .{ label, call.name });
     }
 
     fn permissionTarget(_: *anyopaque, arena: Allocator, _: ToolCall, _: []const []const u8) ![]const u8 {
@@ -689,7 +755,7 @@ const NoticeCapture = struct {
     fn httpError(_: *anyopaque, _: std.http.Status, _: []const u8, _: ?types.CredentialSource) !void {}
 
     fn formatError(_: *anyopaque, arena: Allocator, _: []const u8, err: anyerror) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
+        return arena.print("{s}", .{@errorName(err)});
     }
 };
 
@@ -701,6 +767,7 @@ const StreamCapture = struct {
     code_blocks: std.ArrayList(assistant_presentation.CodeBlockPayload) = .empty,
     thematic_rule_count: usize = 0,
     token_progress_updates: std.ArrayList(types.TurnTokenProgress) = .empty,
+    phase_updates: std.ArrayList(types.TurnPhase) = .empty,
     trace: std.ArrayList(StreamTraceEntry) = .empty,
     presentation_order: std.ArrayList(PresentationEntry) = .empty,
     capture_alloc: Allocator = std.testing.allocator,
@@ -724,6 +791,7 @@ const StreamCapture = struct {
         for (self.code_blocks.items) |*block| block.deinit(alloc);
         self.code_blocks.deinit(alloc);
         self.token_progress_updates.deinit(alloc);
+        self.phase_updates.deinit(alloc);
         self.trace.deinit(alloc);
         self.presentation_order.deinit(alloc);
     }
@@ -763,14 +831,14 @@ const StreamCapture = struct {
     }
 
     fn noopAppendRuntimeContext(_: *anyopaque, _: Allocator, _: *std.ArrayList(ChatMessage)) !void {}
-    fn noopRequestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: PermissionMode, _: []const PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8) !command_admission.PermissionOutcome {
+    fn noopRequestPermission(_: *anyopaque, _: Allocator, _: ToolCall, _: permission_auto_classifier.ReviewTurnContext, _: PermissionMode, _: []const PermissionGrant, _: ?runtime_tool_contracts.LiveToolAuthority, _: ?runtime_tool_contracts.LivePermissionRevalidation, _: []const []const u8, _: ?[]const u8) !command_admission.PermissionOutcome {
         return .{ .decision = .once, .execution_authority = .ordinary };
     }
     fn noopDescribeAction(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
         return arena.dupe(u8, call.name);
     }
     fn noopDescribeDenied(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s} {s}", .{ label, call.name });
+        return arena.print("{s} {s}", .{ label, call.name });
     }
     fn noopPermissionTarget(_: *anyopaque, arena: Allocator, _: ToolCall, _: []const []const u8) ![]const u8 {
         return arena.dupe(u8, "");
@@ -788,7 +856,7 @@ const StreamCapture = struct {
     fn noopCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
     fn noopHttpError(_: *anyopaque, _: std.http.Status, _: []const u8, _: ?types.CredentialSource) !void {}
     fn noopFormatError(_: *anyopaque, arena: Allocator, _: []const u8, err: anyerror) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
+        return arena.print("{s}", .{@errorName(err)});
     }
 
     fn captureToolLifecycle(raw: *anyopaque, event: types.ToolLifecycleEvent) !void {
@@ -810,8 +878,9 @@ const StreamCapture = struct {
         if (self.event_error) |err| return err;
         const progress = switch (event) {
             .turn_token_update => |update| update,
-            .tool_payload_started => {
-                try self.trace.append(self.capture_alloc, .tool_payload_started);
+            .turn_phase_update => |update| {
+                try self.phase_updates.append(self.capture_alloc, update.phase);
+                try self.trace.append(self.capture_alloc, .{ .turn_phase = update.phase });
                 return;
             },
             else => return,
@@ -822,6 +891,7 @@ const StreamCapture = struct {
     fn captureText(raw: *anyopaque, emission: runtime_deps.TextEmission) !void {
         const self: *StreamCapture = @ptrCast(@alignCast(raw));
         switch (emission) {
+            .assistant_started => return,
             .assistant_source => |text| {
                 self.source_calls += 1;
                 if (self.source_error) |err| return err;
@@ -830,15 +900,17 @@ const StreamCapture = struct {
                 self.source_spans.appendAssumeCapacity(owned);
                 return;
             },
-            .assistant_rendered, .operational => {},
+            .assistant_rendered, .assistant_restarted, .operational => {},
         }
 
         self.text_calls += 1;
         if (self.text_error) |err| return err;
 
         const text = switch (emission) {
+            .assistant_started => unreachable,
             .assistant_source => unreachable,
             .assistant_rendered => |text| text,
+            .assistant_restarted => |text| text,
             .operational => |text| text,
         };
 
@@ -874,13 +946,39 @@ const StreamCapture = struct {
     }
 };
 
+test "provider callbacks publish each activity phase transition once" {
+    const alloc = std.testing.allocator;
+    var capture = StreamCapture{};
+    defer capture.deinit(alloc);
+    var hook_set = capture.hooks();
+    var stream_ctx = StreamChunkContext{
+        .hooks = &hook_set,
+        .turn_id = 7,
+        .step_id = 11,
+        .alloc = alloc,
+    };
+    defer stream_ctx.deinit();
+
+    onStreamReasoningChunk(&stream_ctx, "reasoning");
+    onStreamReasoningChunk(&stream_ctx, " continues");
+    onStreamContentChunk(&stream_ctx, "response");
+    onStreamContentChunk(&stream_ctx, " continues\n");
+    onStreamToolStart(&stream_ctx, "command_1", "shell", null, null);
+
+    try std.testing.expectEqualSlices(
+        types.TurnPhase,
+        &.{ .thinking, .generating, .running },
+        capture.phase_updates.items,
+    );
+}
+
 const PresentationEntry = enum { text, table, code_block, thematic_rule };
 
 const StreamTraceEntry = union(enum) {
     text: usize,
     provisional: usize,
     progress: usize,
-    tool_payload_started,
+    turn_phase: types.TurnPhase,
 };
 
 const ansi_span_fixture_env = "FX_TEST_C04_STREAM_ANSI_OSC8_FIXTURE";
@@ -918,7 +1016,7 @@ fn assert_frozen_ansi_span_fixture() !void {
     var oversized_url: [3000]u8 = undefined;
     @memset(&oversized_url, 'a');
     var oversized_line_buf: [3072]u8 = undefined;
-    const oversized_line = try std.fmt.bufPrint(
+    const oversized_line = try std.mem.print(
         &oversized_line_buf,
         "literal [x]({s})\n",
         .{oversized_url[0..]},
@@ -939,14 +1037,14 @@ fn assert_frozen_ansi_span_fixture() !void {
 
     const expected_spans = [_][]const u8{
         "\x1b[1mbold\x1b[22m and \x1b[3mitalic\x1b[23m\n",
-        "\x1b]8;id=fx-1;https://example.com\x1b\\\x1b[4mdocs\x1b[24m\x1b]8;;\x1b\\\n",
-        "\x1b]8;id=fx-2;https://example.com/docs\x1b\\\x1b[4mhttps://example.com/docs\x1b[24m\x1b]8;;\x1b\\,\n",
+        "\x1b]8;id=fx-1;https://example.com\x1b\\\x1b[38;5;75m\x1b[4mdocs\x1b[24m\x1b[39m\x1b]8;;\x1b\\\n",
+        "\x1b]8;id=fx-2;https://example.com/docs\x1b\\\x1b[38;5;75m\x1b[4mhttps://example.com/docs\x1b[24m\x1b[39m\x1b]8;;\x1b\\,\n",
         oversized_line,
         "\x1b[2m\xe2\x94\x82 \x1b[22mconst x = **literal**;\n",
         "\x1b[1mName\x1b[22m \xe2\x94\x82 \x1b[1mAge\x1b[22m\n" ++
             "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\xbc\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\n" ++
             "Ana  \xe2\x94\x82 30 \n",
-        "tail \x1b[1mopen\x1b[22m",
+        "tail **open",
     };
 
     try std.testing.expectEqual(expected_spans.len, capture.text_spans.items.len);
@@ -968,15 +1066,15 @@ test "streamed tool starts emit lifecycle only for identified read-only tools" {
     };
     defer stream_ctx.deinit();
 
-    onStreamToolStart(&stream_ctx, "write_1", "write_file", "file1.txt");
-    onStreamToolStart(&stream_ctx, "edit_1", "edit_file", "file2.txt");
-    onStreamToolStart(&stream_ctx, "ask_1", "request_user_input", null);
-    onStreamToolStart(&stream_ctx, "", "read_file", "src/main.zig");
+    onStreamToolStart(&stream_ctx, "write_1", "write_file", "file1.txt", null);
+    onStreamToolStart(&stream_ctx, "edit_1", "edit_file", "file2.txt", null);
+    onStreamToolStart(&stream_ctx, "ask_1", "request_user_input", null, null);
+    onStreamToolStart(&stream_ctx, "", "read_file", "src/main.zig", null);
 
     try std.testing.expect(stream_ctx.first_model_output_at_ms != null);
     try std.testing.expectEqual(@as(usize, 0), capture.lifecycle_events.items.len);
 
-    onStreamToolStart(&stream_ctx, "read_1", "read_file", "src/main.zig");
+    onStreamToolStart(&stream_ctx, "read_1", "read_file", "src/main.zig", null);
 
     try std.testing.expectEqual(@as(usize, 2), capture.lifecycle_events.items.len);
     try std.testing.expectEqualStrings(
@@ -1002,7 +1100,7 @@ test "streamed unknown tool start preserves the buffered stream boundary" {
     defer stream_ctx.deinit();
 
     try streamAssistantChunk(&stream_ctx, "buffered text");
-    onStreamToolStart(&stream_ctx, "unknown_1", "unknown_tool", null);
+    onStreamToolStart(&stream_ctx, "unknown_1", "unknown_tool", null, null);
 
     try std.testing.expect(stream_ctx.first_model_output_at_ms == null);
     try std.testing.expectEqualStrings("buffered text", stream_ctx.raw_text.items);
@@ -1042,7 +1140,37 @@ test "streamed presentation preserves fragmented byte spans and raw capture" {
     try std.testing.expectEqualStrings("second line\n", capture.text_spans.items[1]);
 }
 
-test "recovery continuation suppresses only a split exact overlap" {
+test "source-only consumers preserve bytes without Markdown work across restart" {
+    const alloc = std.testing.allocator;
+    var capture = StreamCapture{};
+    defer capture.deinit(alloc);
+    var hook_set = capture.hooks();
+    hook_set.render_assistant_text = false;
+    var stream_ctx = StreamChunkContext{
+        .hooks = &hook_set,
+        .semantic_presentation = capture.semanticPresentationSink(),
+        .turn_id = 1,
+        .alloc = alloc,
+    };
+    defer stream_ctx.deinit();
+    const source = " \t\n# Heading\n[link](https://example.com)\n```zig\nconst n =";
+    try streamAssistantChunk(&stream_ctx, source);
+    try flushAssistantStream(&stream_ctx);
+    try std.testing.expectEqualStrings(source, stream_ctx.accepted_source());
+    try std.testing.expectEqualStrings(source, capture.source_spans.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), capture.text_spans.items.len);
+    try std.testing.expectEqual(@as(usize, 0), capture.code_blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 0), stream_ctx.markdown.line_buf.capacity);
+    try stream_ctx.beginRecoveryAttempt();
+    try streamAssistantChunk(&stream_ctx, "Replacement.");
+    try flushAssistantStream(&stream_ctx);
+    try std.testing.expectEqualStrings("Replacement.", stream_ctx.accepted_source());
+    try std.testing.expectEqualStrings(source, stream_ctx.interrupted_source.items);
+    try std.testing.expectEqual(@as(usize, 1), capture.text_spans.items.len);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "Response interrupted") != null);
+}
+
+test "recovery starts a fresh response while retaining interrupted evidence" {
     const alloc = std.testing.allocator;
     var capture = StreamCapture{};
     defer capture.deinit(alloc);
@@ -1050,60 +1178,63 @@ test "recovery continuation suppresses only a split exact overlap" {
     var stream_ctx = StreamChunkContext{ .hooks = &hook_set, .turn_id = 1, .alloc = alloc };
     defer stream_ctx.deinit();
 
-    try streamAssistantChunk(&stream_ctx, "hello world");
-    stream_ctx.beginRecoveryAttempt();
-    try streamAssistantChunk(&stream_ctx, "wor");
-    try std.testing.expectEqual(@as(usize, 1), capture.source_spans.items.len);
-    try streamAssistantChunk(&stream_ctx, "ld and again");
+    try streamAssistantChunk(&stream_ctx, "software");
+    try stream_ctx.beginRecoveryAttempt();
+    try std.testing.expectEqualStrings("", stream_ctx.accepted_source());
+    try std.testing.expectEqualStrings("software", stream_ctx.interruption_source_or(""));
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[capture.text_spans.items.len - 1], "Response interrupted") != null);
+    try streamAssistantChunk(&stream_ctx, "2. A complete replacement.");
     try flushAssistantStream(&stream_ctx);
+    try std.testing.expectEqualStrings("2. A complete replacement.", stream_ctx.accepted_source());
+    try std.testing.expectEqualStrings("2. A complete replacement.", capture.source_spans.items[1]);
 
-    try std.testing.expectEqualStrings("hello world and again", stream_ctx.raw_text.items);
-    try std.testing.expectEqual(@as(usize, 2), capture.source_spans.items.len);
-    try std.testing.expectEqualStrings("hello world", capture.source_spans.items[0]);
-    try std.testing.expectEqualStrings(" and again", capture.source_spans.items[1]);
-
-    stream_ctx.beginRecoveryAttempt();
-    try streamAssistantChunk(&stream_ctx, "A distinct continuation");
-    try flushAssistantStream(&stream_ctx);
-    try std.testing.expectEqualStrings(
-        "hello world and againA distinct continuation",
-        stream_ctx.raw_text.items,
-    );
+    try stream_ctx.beginRecoveryAttempt();
+    try stream_ctx.beginRecoveryAttempt();
+    try std.testing.expectEqualStrings("2. A complete replacement.", stream_ctx.interruption_source_or(""));
+    try streamAssistantChunk(&stream_ctx, "2. A complete replacement.");
+    try std.testing.expectEqualStrings("2. A complete replacement.", stream_ctx.accepted_source());
 }
 
-test "presented recovery source seeds continuation without rendering twice" {
+test "interruption source retains accepted preview until a valid replacement" {
     const alloc = std.testing.allocator;
-    var capture = StreamCapture{};
-    defer capture.deinit(alloc);
-    var hook_set = capture.hooks();
-    var stream_ctx = StreamChunkContext{
-        .hooks = &hook_set,
-        .flush_assistant_stream_per_content_chunk = true,
-        .turn_id = 1,
-        .alloc = alloc,
+    const prior = "The accepted English preview.";
+    const replacement = "The valid English replacement.";
+    const rejected = "我会先检查锁文件和依赖清单。";
+    const cases = [_]struct {
+        prior: []const u8,
+        candidate: []const u8,
+        interruption: []const u8,
+        accepted: []const u8,
+    }{
+        .{ .prior = prior, .candidate = rejected, .interruption = prior, .accepted = "" },
+        .{ .prior = "", .candidate = rejected, .interruption = "", .accepted = "" },
+        .{ .prior = prior, .candidate = "", .interruption = prior, .accepted = "" },
+        .{ .prior = prior, .candidate = replacement, .interruption = replacement, .accepted = replacement },
     };
-    defer stream_ctx.deinit();
 
-    try stream_ctx.restoreRecoverySource("Partial output before EOF.", true);
+    for (cases) |case| {
+        var capture = StreamCapture{};
+        defer capture.deinit(alloc);
+        var hook_set = capture.hooks();
+        hook_set.render_assistant_text = false;
+        var stream_ctx = StreamChunkContext{
+            .hooks = &hook_set,
+            .turn_id = 1,
+            .alloc = alloc,
+            .response_language_expected = .latin,
+        };
+        defer stream_ctx.deinit();
+        try stream_ctx.restoreRecoverySource(case.prior, true);
+        try stream_ctx.beginRecoveryAttempt();
+        try streamAssistantChunk(&stream_ctx, case.candidate);
 
-    try std.testing.expectEqualStrings("Partial output before EOF.", stream_ctx.raw_text.items);
-    try std.testing.expectEqual(@as(usize, 1), capture.source_spans.items.len);
-    try std.testing.expectEqual(@as(usize, 0), capture.text_spans.items.len);
-
-    stream_ctx.beginRecoveryAttempt();
-    onStreamContentChunk(&stream_ctx, "Partial output before EOF.Recovered final output once.");
-
-    try std.testing.expectEqualStrings(
-        "Partial output before EOF.Recovered final output once.",
-        stream_ctx.raw_text.items,
-    );
-    try std.testing.expectEqual(@as(usize, 2), capture.source_spans.items.len);
-    try std.testing.expectEqualStrings("Recovered final output once.", capture.source_spans.items[1]);
-    try std.testing.expectEqual(@as(usize, 1), capture.text_spans.items.len);
-    try std.testing.expectEqualStrings("Recovered final output once.", capture.text_spans.items[0]);
+        try std.testing.expectEqualStrings(case.interruption, stream_ctx.interruption_source_or(""));
+        try std.testing.expectEqualStrings(case.accepted, stream_ctx.accepted_source());
+        try std.testing.expectEqual(@as(usize, if (case.accepted.len == 0) 0 else 1), capture.source_spans.items.len);
+    }
 }
 
-test "presented recovery source preserves an unfinished semantic code fence" {
+test "checkpoint recovery restarts Markdown without replaying an unfinished code fence" {
     const alloc = std.testing.allocator;
     var capture = StreamCapture{};
     defer capture.deinit(alloc);
@@ -1116,58 +1247,21 @@ test "presented recovery source preserves an unfinished semantic code fence" {
     };
     defer stream_ctx.deinit();
 
-    const prefix = "Before code.\n```zig\nconst value =";
-    try stream_ctx.restoreRecoverySource(prefix, true);
-    stream_ctx.beginRecoveryAttempt();
-    try streamAssistantChunk(
-        &stream_ctx,
-        prefix ++ " 1;\n```\nAfter code.\n",
-    );
+    const partial = "Before code.\n```zig\nconst value =";
+    try stream_ctx.restoreRecoverySource(partial, true);
+    try std.testing.expectEqual(@as(usize, 0), capture.source_spans.items.len);
+    try stream_ctx.beginRecoveryAttempt();
+    const replacement = "```zig\nconst value = 2;\n```\nAfter code.\n";
+    try streamAssistantChunk(&stream_ctx, replacement);
     try flushAssistantStream(&stream_ctx);
 
-    try std.testing.expectEqualStrings(
-        prefix ++ " 1;\n```\nAfter code.\n",
-        stream_ctx.raw_text.items,
-    );
-    try std.testing.expectEqual(@as(usize, 2), capture.source_spans.items.len);
-    try std.testing.expectEqualStrings(" 1;\n```\nAfter code.\n", capture.source_spans.items[1]);
+    try std.testing.expectEqualStrings(replacement, stream_ctx.accepted_source());
+    try std.testing.expectEqualStrings(partial, stream_ctx.interrupted_source.items);
+    try std.testing.expectEqual(@as(usize, 1), capture.source_spans.items.len);
+    try std.testing.expectEqualStrings(replacement, capture.source_spans.items[0]);
     try std.testing.expectEqual(@as(usize, 1), capture.code_blocks.items.len);
-    try std.testing.expectEqualStrings("zig", capture.code_blocks.items[0].language);
-    try std.testing.expectEqualStrings(" 1;\n", capture.code_blocks.items[0].code);
-    try std.testing.expectEqual(@as(usize, 1), capture.text_spans.items.len);
-    try std.testing.expectEqualStrings("After code.\n", capture.text_spans.items[0]);
-}
-
-test "adversarial repetitive continuation exhausts the probe budget without duplicate output" {
-    const alloc = std.testing.allocator;
-    var capture = StreamCapture{};
-    defer capture.deinit(alloc);
-    var hook_set = capture.hooks();
-    var stream_ctx = StreamChunkContext{ .hooks = &hook_set, .turn_id = 1, .alloc = alloc };
-    defer stream_ctx.deinit();
-
-    const prefix = try alloc.alloc(u8, 32 * 1024);
-    defer alloc.free(prefix);
-    @memset(prefix, 'a');
-    try streamAssistantChunk(&stream_ctx, prefix);
-    stream_ctx.beginRecoveryAttempt();
-
-    const chunk = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    var sent: usize = 0;
-    while (sent < prefix.len) : (sent += chunk.len) {
-        try streamAssistantChunk(&stream_ctx, chunk);
-    }
-    try streamAssistantChunk(&stream_ctx, "b");
-
-    try std.testing.expectEqual(@as(usize, 0), stream_ctx.continuation_probe_remaining);
-    try std.testing.expect(stream_ctx.continuation_resolved);
-
-    try flushAssistantStream(&stream_ctx);
-    try std.testing.expect(stream_ctx.continuation_resolved);
-    try std.testing.expectEqual(prefix.len + 1, stream_ctx.raw_text.items.len);
-    try std.testing.expectEqual(@as(u8, 'b'), stream_ctx.raw_text.items[stream_ctx.raw_text.items.len - 1]);
-    try std.testing.expectEqual(@as(usize, 2), capture.source_spans.items.len);
-    try std.testing.expectEqualStrings("b", capture.source_spans.items[1]);
+    try std.testing.expectEqualStrings("const value = 2;\n", capture.code_blocks.items[0].code);
+    try std.testing.expectEqualStrings("After code.\n", capture.text_spans.items[capture.text_spans.items.len - 1]);
 }
 
 test "streamed hard breaks preserve raw source and EOF backslashes" {
@@ -1230,8 +1324,8 @@ test "streamed markdown image retains raw source and publishes its rendered labe
         stream_ctx.raw_text.items,
     );
     try std.testing.expectEqual(@as(usize, 1), capture.text_spans.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, capture.text_spans.items[0], "▧ architecture") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capture.text_spans.items[0], "![architecture]") == null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "▧ architecture") != null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "![architecture]") == null);
 }
 
 test "streamed angle autolinks retain raw source and publish rendered labels" {
@@ -1251,11 +1345,11 @@ test "streamed angle autolinks retain raw source and publish rendered labels" {
         stream_ctx.raw_text.items,
     );
     try std.testing.expectEqual(@as(usize, 1), capture.text_spans.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, capture.text_spans.items[0], "\x1b]8;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capture.text_spans.items[0], "https://example.com/docs") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capture.text_spans.items[0], "mailto:dev@example.com") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capture.text_spans.items[0], "<https://example.com/docs>") == null);
-    try std.testing.expect(std.mem.indexOf(u8, capture.text_spans.items[0], "<dev@example.com>") == null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "\x1b]8;") != null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "https://example.com/docs") != null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "mailto:dev@example.com") != null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "<https://example.com/docs>") == null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "<dev@example.com>") == null);
 }
 
 test "streamed setext heading waits for its underline and flushes before a tool" {
@@ -1277,7 +1371,7 @@ test "streamed setext heading waits for its underline and flushes before a tool"
     try streamAssistantChunk(&stream_ctx, "-");
     try std.testing.expectEqual(@as(usize, 0), capture.text_spans.items.len);
 
-    onStreamToolStart(&stream_ctx, "read_1", "read_file", null);
+    onStreamToolStart(&stream_ctx, "read_1", "read_file", null, null);
 
     try std.testing.expectEqualStrings("Streamed title\n---", stream_ctx.raw_text.items);
     try std.testing.expectEqual(@as(usize, 0), capture.thematic_rule_count);
@@ -1308,7 +1402,7 @@ test "streamed definition list retains source and clears before a tool" {
     try streamAssistantChunk(&stream_ctx, "Sta");
     try streamAssistantChunk(&stream_ctx, "tus\n: **Run");
     try streamAssistantChunk(&stream_ctx, "ning**\n");
-    onStreamToolStart(&stream_ctx, "read_1", "read_file", null);
+    onStreamToolStart(&stream_ctx, "read_1", "read_file", null, null);
     try streamAssistantChunk(&stream_ctx, ": stale\n");
     try flushAssistantStream(&stream_ctx);
 
@@ -1332,10 +1426,27 @@ test "streamed presentation preserves ANSI OSC 8 code fence and table spans" {
     defer environ.deinit();
     try environ.put(ansi_span_fixture_env, "1");
 
+    // The fixture reaches the shell tool, which imports the `test_paths`
+    // module that `zig build test` generates, so the nested compile needs the
+    // same module.
+    const test_paths = @import("test_paths");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_paths_source = try alloc.print(
+        "pub const product_exe: []const u8 = \"{f}\";\npub const source_root: []const u8 = \"{f}\";\n",
+        .{ std.zig.fmtString(test_paths.product_exe), std.zig.fmtString(test_paths.source_root) },
+    );
+    defer alloc.free(test_paths_source);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "test_paths.zig", .data = test_paths_source });
+    const test_paths_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "test_paths.zig");
+    defer alloc.free(test_paths_path);
+    const test_paths_module = try alloc.print("-Mtest_paths={s}", .{test_paths_path});
+    defer alloc.free(test_paths_module);
+
     const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
     defer alloc.free(cwd);
     const result = try std.process.run(alloc, std.testing.io, .{
-        .argv = &.{ "zig", "test", "-lc", "-Mroot=src/main.zig", "--test-filter", ansi_span_test_name },
+        .argv = &.{ "zig", "test", "-lc", "--dep", "test_paths", "-Mroot=src/main.zig", test_paths_module, "--test-filter", ansi_span_test_name },
         .cwd = .{ .path = cwd },
         .environ_map = &environ,
         .stdout_limit = .limited(64 * 1024),
@@ -1372,7 +1483,7 @@ test "streamed footnotes retain raw source and flush before a tool" {
             "| api | [^status] |\n",
     );
     try streamAssistantChunk(&stream_ctx, "[^status]: OBSERVER_FOOTNOTE_PROJECTION\n");
-    onStreamToolStart(&stream_ctx, "read_1", "read_file", null);
+    onStreamToolStart(&stream_ctx, "read_1", "read_file", null, null);
 
     try std.testing.expectEqualStrings(
         "The deployment is stable[^status].\n" ++
@@ -1387,7 +1498,7 @@ test "streamed footnotes retain raw source and flush before a tool" {
         &.{ .text, .table, .text },
         capture.presentation_order.items,
     );
-    try std.testing.expect(std.mem.indexOf(u8, capture.text_spans.items[0], "\x1b[2m[1]\x1b[22m") != null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "\x1b[2m[1]\x1b[22m") != null);
     try std.testing.expectEqualStrings(
         "\n\x1b[2m[1] \x1b[22mOBSERVER_FOOTNOTE_PROJECTION\n",
         capture.text_spans.items[1],
@@ -1440,7 +1551,7 @@ test "streamed tool start flushes presentation before separator and lifecycle" {
         defer stream_ctx.deinit();
 
         try streamAssistantChunk(&stream_ctx, "partial");
-        onStreamToolStart(&stream_ctx, case.id, case.name, null);
+        onStreamToolStart(&stream_ctx, case.id, case.name, null, null);
 
         try std.testing.expectEqual(@as(usize, 2), capture.text_spans.items.len);
         try std.testing.expectEqualStrings("partial", capture.text_spans.items[0]);
@@ -1451,19 +1562,20 @@ test "streamed tool start flushes presentation before separator and lifecycle" {
             try std.testing.expectEqualStrings(case.id, capture.lifecycle_events.items[0].provisional.id.call_id);
             try std.testing.expectEqualStrings(case.name, capture.lifecycle_events.items[0].provisional.tool_name.?);
             try std.testing.expectEqualStrings(case.id, capture.lifecycle_events.items[1].progress.id.call_id);
-            try std.testing.expectEqual(@as(usize, 4), capture.trace.items.len);
+            try std.testing.expectEqual(@as(usize, 5), capture.trace.items.len);
             try std.testing.expectEqual(StreamTraceEntry{ .text = 0 }, capture.trace.items[0]);
             try std.testing.expectEqual(StreamTraceEntry{ .text = 1 }, capture.trace.items[1]);
-            try std.testing.expectEqual(StreamTraceEntry{ .provisional = 0 }, capture.trace.items[2]);
-            try std.testing.expectEqual(StreamTraceEntry{ .progress = 1 }, capture.trace.items[3]);
+            try std.testing.expectEqual(types.TurnPhase.running, capture.trace.items[2].turn_phase);
+            try std.testing.expectEqual(StreamTraceEntry{ .provisional = 0 }, capture.trace.items[3]);
+            try std.testing.expectEqual(StreamTraceEntry{ .progress = 1 }, capture.trace.items[4]);
         } else {
             try std.testing.expectEqual(@as(usize, 0), capture.lifecycle_events.items.len);
-            // The payload notice lands after the separator: text arriving after
+            // The working phase lands after the separator: text arriving after
             // it would hand the activity row back to the response.
             try std.testing.expectEqual(@as(usize, 3), capture.trace.items.len);
             try std.testing.expectEqual(StreamTraceEntry{ .text = 0 }, capture.trace.items[0]);
             try std.testing.expectEqual(StreamTraceEntry{ .text = 1 }, capture.trace.items[1]);
-            try std.testing.expectEqual(StreamTraceEntry.tool_payload_started, capture.trace.items[2]);
+            try std.testing.expectEqual(types.TurnPhase.running, capture.trace.items[2].turn_phase);
         }
     }
 
@@ -1474,15 +1586,16 @@ test "streamed tool start flushes presentation before separator and lifecycle" {
     defer newline_stream_ctx.deinit();
 
     try streamAssistantChunk(&newline_stream_ctx, "complete line\n");
-    onStreamToolStart(&newline_stream_ctx, "read_newline", "read_file", null);
+    onStreamToolStart(&newline_stream_ctx, "read_newline", "read_file", null, null);
 
     try std.testing.expectEqual(@as(usize, 1), newline_capture.text_spans.items.len);
     try std.testing.expectEqualStrings("complete line\n", newline_capture.text_spans.items[0]);
     try std.testing.expectEqual(@as(usize, 2), newline_capture.lifecycle_events.items.len);
-    try std.testing.expectEqual(@as(usize, 3), newline_capture.trace.items.len);
+    try std.testing.expectEqual(@as(usize, 4), newline_capture.trace.items.len);
     try std.testing.expectEqual(StreamTraceEntry{ .text = 0 }, newline_capture.trace.items[0]);
-    try std.testing.expectEqual(StreamTraceEntry{ .provisional = 0 }, newline_capture.trace.items[1]);
-    try std.testing.expectEqual(StreamTraceEntry{ .progress = 1 }, newline_capture.trace.items[2]);
+    try std.testing.expectEqual(types.TurnPhase.running, newline_capture.trace.items[1].turn_phase);
+    try std.testing.expectEqual(StreamTraceEntry{ .provisional = 0 }, newline_capture.trace.items[2]);
+    try std.testing.expectEqual(StreamTraceEntry{ .progress = 1 }, newline_capture.trace.items[3]);
 }
 
 test "assistant prose before the first tool starts a new presentation group" {
@@ -1502,7 +1615,7 @@ test "assistant prose before the first tool starts a new presentation group" {
     defer stream_ctx.deinit();
 
     try streamAssistantChunk(&stream_ctx, "new batch");
-    onStreamToolStart(&stream_ctx, "read_1", "read_file", null);
+    onStreamToolStart(&stream_ctx, "read_1", "read_file", null, null);
 
     try std.testing.expectEqual(
         types.ToolPresentationGroupId{ .turn_id = 7, .anchor_step_id = 12 },
@@ -1526,9 +1639,9 @@ test "assistant prose between streamed sibling tools keeps their presentation gr
     };
     defer stream_ctx.deinit();
 
-    onStreamToolStart(&stream_ctx, "read_1", "read_file", null);
+    onStreamToolStart(&stream_ctx, "read_1", "read_file", null, null);
     try streamAssistantChunk(&stream_ctx, "provider bridge");
-    onStreamToolStart(&stream_ctx, "read_2", "read_file", null);
+    onStreamToolStart(&stream_ctx, "read_2", "read_file", null, null);
 
     const expected = types.ToolPresentationGroupId{
         .turn_id = 7,
@@ -1582,7 +1695,7 @@ test "semantic table flushes before a tool without visible text or extra separat
             "|------|------:|\n" ++
             "| api | 7 |\n",
     );
-    onStreamToolStart(&stream_ctx, "read_1", "read_file", null);
+    onStreamToolStart(&stream_ctx, "read_1", "read_file", null, null);
 
     try std.testing.expectEqual(@as(usize, 1), capture.tables.items.len);
     try std.testing.expectEqual(@as(usize, 0), capture.text_spans.items.len);
@@ -1629,7 +1742,7 @@ test "semantic thematic rule flushes at EOF before a tool after a blank separato
     defer stream_ctx.deinit();
 
     try streamAssistantChunk(&stream_ctx, "Before rule.\n\n---");
-    onStreamToolStart(&stream_ctx, "read_1", "read_file", null);
+    onStreamToolStart(&stream_ctx, "read_1", "read_file", null, null);
 
     try std.testing.expectEqualStrings("Before rule.\n\n---", stream_ctx.raw_text.items);
     try std.testing.expectEqual(@as(usize, 1), capture.thematic_rule_count);
@@ -1813,7 +1926,7 @@ test "streamed prefix without a code opener is discarded before a tool boundary"
     defer stream_ctx.deinit();
 
     try streamAssistantChunk(&stream_ctx, "   ");
-    onStreamToolStart(&stream_ctx, "read_1", "read_file", "src/main.zig");
+    onStreamToolStart(&stream_ctx, "read_1", "read_file", "src/main.zig", null);
     try streamAssistantChunk(&stream_ctx, "after tool\n");
 
     try std.testing.expectEqualStrings("   after tool\n", stream_ctx.raw_text.items);
@@ -1894,7 +2007,7 @@ test "stream callbacks publish absolute raw output token progress" {
 }
 
 test "streamed presentation suppresses callback-time failures" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
 
     {
         var capture = StreamCapture{};
@@ -1946,7 +2059,7 @@ test "streamed presentation suppresses callback-time failures" {
 
         try std.testing.expectEqualStrings("visible\n", stream_ctx.raw_text.items);
         try std.testing.expectEqual(@as(usize, 1), capture.source_calls);
-        try std.testing.expectEqual(@as(usize, 0), capture.event_calls);
+        try std.testing.expectEqual(@as(usize, 1), capture.event_calls);
         try std.testing.expectEqual(@as(usize, 0), capture.text_calls);
     }
 
@@ -1960,7 +2073,7 @@ test "streamed presentation suppresses callback-time failures" {
         onStreamContentChunk(&stream_ctx, "visible\n");
 
         try std.testing.expectEqualStrings("visible\n", stream_ctx.raw_text.items);
-        try std.testing.expectEqual(@as(usize, 0), capture.event_calls);
+        try std.testing.expectEqual(@as(usize, 1), capture.event_calls);
         try std.testing.expectEqual(@as(usize, 1), capture.text_calls);
     }
 
@@ -1974,7 +2087,7 @@ test "streamed presentation suppresses callback-time failures" {
         onStreamContentChunk(&stream_ctx, "visible\n");
 
         try std.testing.expectEqualStrings("visible\n", stream_ctx.raw_text.items);
-        try std.testing.expectEqual(@as(usize, 0), capture.event_calls);
+        try std.testing.expectEqual(@as(usize, 1), capture.event_calls);
         try std.testing.expectEqual(@as(usize, 1), capture.text_calls);
     }
 
@@ -1985,7 +2098,7 @@ test "streamed presentation suppresses callback-time failures" {
         var stream_ctx = StreamChunkContext{ .hooks = &hook_set, .turn_id = 1, .alloc = alloc };
         defer stream_ctx.deinit();
 
-        onStreamToolStart(&stream_ctx, "read_1", "read_file", null);
+        onStreamToolStart(&stream_ctx, "read_1", "read_file", null, null);
 
         try std.testing.expectEqual(@as(usize, 1), capture.lifecycle_calls);
         try std.testing.expectEqual(@as(usize, 0), capture.lifecycle_events.items.len);
@@ -2076,7 +2189,7 @@ fn checkSemanticCodeBlockCaptureAllocationFailures(alloc: Allocator) !void {
 
 test "streamed presentation cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkStreamPresentationAllocationFailures,
         .{},
     );
@@ -2084,7 +2197,7 @@ test "streamed presentation cleans up every allocation failure" {
 
 test "semantic table capture cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkSemanticTableCaptureAllocationFailures,
         .{},
     );
@@ -2092,7 +2205,7 @@ test "semantic table capture cleans up every allocation failure" {
 
 test "semantic code block capture cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkSemanticCodeBlockCaptureAllocationFailures,
         .{},
     );
